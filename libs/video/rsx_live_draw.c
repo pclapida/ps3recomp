@@ -3559,6 +3559,62 @@ static int ld_scaled_blit(u32 si, float sx, float sy, float sw, float sh,
     return 1;
 }
 
+/* Present a surface whose size is not the swap chain's: draw it stretched over
+ * the whole backbuffer. CopyResource needs identical sizes -- Twisted Metal
+ * scans out a 720x480 display buffer into a 1280x704 window, and the copy put
+ * it in the top-left corner. src_w/src_h: the display buffer's own size, or 0
+ * for the whole surface. Returns 1 when recorded. */
+static int ld_present_stretched(u32 si, u32 bbi, u32 src_w, u32 src_h)
+{
+    surface_t* s = &g.surfaces[si];
+    if (!s->tex || !s->w || !s->h || !g.width || !g.height) return 0;
+    if (!src_w || src_w > s->w) src_w = s->w;
+    if (!src_h || src_h > s->h) src_h = s->h;
+    ID3D12PipelineState* pso = ld_scaled_blit_pso(DXGI_FORMAT_R8G8B8A8_UNORM);
+    if (!pso) return 0;
+    u32 slots[SRV_TABLE_SIZE];
+    for (u32 i = 0; i < SRV_TABLE_SIZE; i++) slots[i] = SRV_WHITE;
+    slots[0] = SRV_SURFACE_BASE + si;
+    const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
+    if (!table.ptr) return 0;
+    ID3D12Resource* bb = g.backbuf[bbi];
+    D3D12_RESOURCE_BARRIER bar[2] = {0};
+    bar[0].Type = bar[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar[0].Transition.pResource = s->tex;
+    bar[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    bar[1].Transition.pResource = bb;
+    bar[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(bbi);   /* [0, LD_SWAP_BUFFERS) = backbuffers */
+    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
+    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
+    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+    g.list->lpVtbl->SetPipelineState(g.list, pso);
+    g.list->lpVtbl->SetGraphicsRootSignature(g.list, g_sblit_rs);
+    const float r[4] = { 0.0f, 0.0f, (float)src_w / (float)s->w, (float)src_h / (float)s->h };
+    g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 4, r, 0);
+    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)g.width, (float)g.height, 0.0f, 1.0f };
+    D3D12_RECT sc = { 0, 0, (LONG)g.width, (LONG)g.height };
+    g.list->lpVtbl->RSSetViewports(g.list, 1, &vp);
+    g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+    g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
+    bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+    { static int n = 0; if (n++ < 2)
+        fprintf(stderr, "[present] surf %u %ux%u (src %ux%u) stretched to %ux%u\n",
+                si, s->w, s->h, src_w, src_h, g.width, g.height); }
+    return 1;
+}
+
 int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, u32 dt,
                                u32 dst_loc, u32 dst_abs, u32 dst_pitch,
                                u32 out_x, u32 out_y, u32 out_w, u32 out_h)
@@ -9544,6 +9600,19 @@ void rsx_live_draw_present(u32 buffer_id)
     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
     ID3D12Resource* bb = g.backbuf[bbi];
 
+    /* A surface of another size than the swap chain is drawn stretched instead
+     * of copied (CopyResource needs identical sizes). LD_PRESENT_STRETCH=0
+     * restores the 1:1 copy. */
+    static int stretch_on = -1;
+    if (stretch_on < 0) { const char* e = getenv("LD_PRESENT_STRETCH"); stretch_on = e ? atoi(e) : 1; }
+    u32 src_w = 0, src_h = 0;
+    if (buffer_id < 8 && g.display_buffers[buffer_id].valid && !g.display_buffers[buffer_id].resolve_src) {
+        src_w = g.display_buffers[buffer_id].width; src_h = g.display_buffers[buffer_id].height;
+    }
+    if (stretch_on && (presented_surface->w != g.width || presented_surface->h != g.height) &&
+        ld_present_stretched(target, bbi, src_w, src_h)) {
+        /* drawn over the whole backbuffer */
+    } else {
     D3D12_RESOURCE_BARRIER bar[2] = {0};
     bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     bar[0].Transition.pResource = srcimg;
@@ -9564,6 +9633,7 @@ void rsx_live_draw_present(u32 buffer_id)
     bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+    }
 
     ld_flush(LD_FLUSH_PRESENT);
     {
