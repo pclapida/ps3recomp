@@ -2389,6 +2389,18 @@ void cellGcm_ref_on_poll(void)
 
 static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began waiting on the current acquire */
 
+/* Where the walker is in the title's own command stream: its fetch offset, or,
+ * inside a CALL, the offset it returns to. The published `get` cannot answer
+ * that: it is written at a JUMP and at the end of a pass, and a pass that ends
+ * inside a called list (an Edge geometry segment in main memory, parked on a
+ * hole) leaves it there. A title-side wait that must know which of its
+ * segments the RSX is still in reads this. Racy by nature, like `get`. */
+u32 cellGcm_fifo_walker_offset(void)
+{
+    const u32 c = s_fifo_calloff;
+    return c ? c : s_fifo_getoff;
+}
+
 /* RSX_WALKER_PROF=<file>: an in-process sampling profile of the FIFO walker
  * thread, for hosts where an external sampler cannot attach. Once
  * RSX_WALKER_PROF_TRIGGER=<file> exists (immediately when unset), a sampler
@@ -3129,6 +3141,62 @@ static void gcm_rsx_process_fifo_unlocked(void)
             static int blk = -1; static unsigned blk_ms;
             if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0;
                            const char* t = getenv("GCM_SEMA_ACQUIRE_MS"); blk_ms = t ? (unsigned)atoi(t) : 0; }
+            /* GCM_SEMA_ACQUIRE=2: wait HERE instead of ending the pass. Mode 1
+             * gives the drain back to its caller on every acquire that is not
+             * met yet and looks again on the next pass, a millisecond or a
+             * whole tick later: a title that acquires every frame crawls
+             * (Twisted Metal: menus at 9 fps, the match never starts). Here
+             * the walker stays on the acquire until the label has the value or
+             * GCM_SEMA_ACQUIRE_MS (default 20 in this mode) has passed, then
+             * goes on either way -- the producer is another thread (an SPU
+             * job, the PPU), so it can write while this one waits.
+             *
+             * GCM_SEMA_ACQUIRE_OFFS=<hex>[,<hex>...] limits mode 2 to the
+             * acquires at those label offsets; every other one is skipped as
+             * in mode 0. Twisted Metal acquires 0x420, the label its SpuPostFX
+             * thread writes when the frame's composite is in main memory,
+             * right before the copy back to the surface it is scaled from:
+             * honouring that one acquire is what shows whole frames. */
+            static int offs_n = -1; static u32 offs[8];
+            if (offs_n < 0) { offs_n = 0; const char* e = getenv("GCM_SEMA_ACQUIRE_OFFS");
+                              for (const char* q = e; q && *q && offs_n < 8; ) {
+                                  char* end; offs[offs_n++] = (u32)strtoul(q, &end, 16);
+                                  if (end == q) { offs_n--; break; }
+                                  q = end; while (*q == ',' || *q == ' ') q++; } }
+            int offs_ok = offs_n == 0;
+            for (int i = 0; i < offs_n; i++) if (offs[i] == s_sema_offset) offs_ok = 1;
+            if (blk == 2 && !offs_ok) {
+                /* not one of the listed offsets: skipped, as in mode 0 */
+            } else
+            if (blk == 2) {
+                static unsigned long long n_wait, n_timeout, total_ms;
+                extern unsigned long long ps3_ms_now(void);
+                const unsigned long long limit = blk_ms ? blk_ms : 20u;
+                const unsigned long long t0 = ps3_ms_now();
+                unsigned long long now = t0;
+                while (vm_read32(la) != v && (now = ps3_ms_now()) - t0 < limit) {
+                    /* Yield for the first two milliseconds, then sleep: the
+                     * producer may need this core, and a wait that long does
+                     * not notice a millisecond more. */
+#ifdef _WIN32
+                    Sleep(now - t0 < 2 ? 0 : 1);
+#else
+                    if (now - t0 < 2) sched_yield(); else usleep(500);
+#endif
+                }
+                n_wait++; total_ms += now - t0;
+                if (vm_read32(la) != v) {
+                    n_timeout++;
+                    { static int tn; if (PS3_LOG_FIRST(tn, 12))
+                        fprintf(stderr, "[SEMA] acquire off=0x%X == 0x%08X gave up after %llu ms (label 0x%08X, %llu of %llu)\n",
+                                s_sema_offset, v, now - t0, vm_read32(la), n_timeout, n_wait); }
+                }
+                if (n_wait == 1ull || (n_wait % 4096ull) == 0)
+                    fprintf(stderr, "[SEMA] mode 2: %llu acquires waited in place, %llu timed out "
+                                    "(%llu ms limit), %.2f ms each; last off=0x%X want=0x%08X\n",
+                            n_wait, n_timeout, limit, (double)total_ms / (double)n_wait,
+                            s_sema_offset, v);
+            } else
             if (blk) {
                 /* GCM_SEMA_ACQUIRE_MS=<ms>: a bounded wait. The hardware waits
                  * for ever; an emulated producer that never comes (a boot-time
