@@ -84,6 +84,19 @@ void rsx_live_draw_note_inline_transfer(u32 dma, u32 offset, u32 value);
  * Returns 1 when handled (the guest-memory copy still runs regardless). */
 int  rsx_live_draw_blit(u32 src_loc, u32 src_abs, u32 src_pitch,
                         u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h);
+/* NV3089 copies with one end in main memory (LD_NV3089_GUEST, default on),
+ * called around the guest-memory copy. Rectangles are in 32-bit transfer
+ * pixels; `offset` is the location-relative byte of the top-left one.
+ * guest_read, before the copy: a local source that is a live colour surface
+ * or a written zeta is read back into guest memory in the guest's layout.
+ * `dst_location` is where the copy goes; only local -> main does anything.
+ * guest_wrote, after the copy: a local destination that is a live surface is
+ * uploaded from guest memory. `src_location` is where the copy came from;
+ * only main -> local does anything. */
+void rsx_live_draw_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h,
+                              u32 dst_location);
+void rsx_live_draw_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h,
+                               u32 src_location);
 /* Scaled NV3089 blit from a live surface onto a display buffer's origin: the
  * flip presents that surface when the buffer has none of its own. */
 void rsx_live_draw_note_resolve(u32 src_loc, u32 src_abs, u32 dst_loc, u32 dst_abs);

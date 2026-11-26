@@ -43,6 +43,10 @@ void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
 { (void)d; (void)o; (void)v; }
 int  rsx_live_draw_blit(u32 sl, u32 sa, u32 sp, u32 dl, u32 da, u32 dp, u32 w, u32 h)
 { (void)sl; (void)sa; (void)sp; (void)dl; (void)da; (void)dp; (void)w; (void)h; return 0; }
+void rsx_live_draw_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h, u32 d)
+{ (void)l; (void)o; (void)p; (void)w; (void)h; (void)d; }
+void rsx_live_draw_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h, u32 sl)
+{ (void)l; (void)o; (void)p; (void)w; (void)h; (void)sl; }
 int  rsx_live_draw_resolve_blit(u32 sl, u32 sa, u32 sp, u32 ds, u32 dt, u32 dl, u32 da,
                                 u32 dp, u32 x, u32 y, u32 w, u32 h)
 { (void)sl; (void)sa; (void)sp; (void)ds; (void)dt; (void)dl; (void)da; (void)dp;
@@ -249,6 +253,8 @@ typedef struct {
     D3D12_RESOURCE_STATES snapshot_state;
     ID3D12Resource* pack;                 /* RGBA8: bytes of the Z24S8 word, A,R,G,B order */
     D3D12_RESOURCE_STATES pack_state;
+    u32 pitch;                            /* guest row pitch (SURFACE_PITCH_Z), 0 = not bound yet */
+    u64 write_gen;                        /* bumped by every draw and clear bound to it (rsx_live_draw_guest_read) */
     int cleared;
     int had_write;
     int snapshot_valid;
@@ -3439,6 +3445,650 @@ static int surface_containing(u32 location, u32 abs, u32 pitch, u32 w, u32 h,
 static FILE* s_csv_file;       /* defined with live_draw_csv_emit */
 static int   s_csv_gate_open;
 
+/* LD_NV3089_GUEST (default on; 0 = the GPU-only mirror above, as before).
+ *
+ * Twisted Metal composes its final image outside the GPU. Each frame it
+ * copies layer A (0:0xAB0000), layer B (0:0x1190000), the zeta (0:0x1870000)
+ * and a half-resolution corner of the HDR target to main memory with NV3089,
+ * works on them there, and copies the result from main memory back into
+ * 0:0x1190000, which is then scaled to the screen. Mirrored as GPU copies
+ * between live surfaces, none of those pixels ever reached guest memory and
+ * nothing written there ever reached a surface: the screen showed layer A
+ * raw (RGBM without its multiplier, no sky).
+ *
+ * With the switch on, cellGcmSys' guest-memory copy is made true on both
+ * sides: before it, a local source that lives on the GPU is read back into
+ * guest memory (rsx_live_draw_guest_read); after it, a local destination
+ * that is a live surface is uploaded from guest memory
+ * (rsx_live_draw_guest_wrote). Each read-back flushes and waits for the GPU:
+ * correctness first, batching per frame is a later step. */
+static int ld_nv3089_guest(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("LD_NV3089_GUEST");
+        on = e ? atoi(e) != 0 : 1;
+        fprintf(stderr, "[nv3089-guest] LD_NV3089_GUEST=%d: NV3089 copies through main "
+                        "memory %s\n",
+                on, on ? "round-trip guest memory (read-back / upload)"
+                       : "mirrored on the GPU only (legacy)");
+    }
+    return on;
+}
+
+static int zdepth_snapshot(u32 slot);
+
+/* The live colour surface holding the guest bytes of a transfer rectangle:
+ * `abs` is its top-left byte, `pitch` the guest row pitch, `w` its width in
+ * 32-bit transfer pixels. An FP16 surface texel is two of those, so the
+ * rectangle is matched in bytes and returned in surface texels.
+ *
+ * The byte must lie inside the surface's OWN rows, at the surface's own
+ * pitch when it is known. Dividing the distance from any lower surface by
+ * the transfer's pitch is not enough: 0:0x1BE0000 at pitch 10240 is "row 352"
+ * of whatever starts at 0:0x1870000, and its read-back came from there.
+ * Among the surfaces that qualify, one that starts at the address, then the
+ * one written last. */
+static int ld_guest_surface(u32 location, u32 abs, u32 pitch, u32 w, u32 h,
+                            u32* ox, u32* oy, u32* ow)
+{
+    int best = -1, best_exact = 0;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const surface_t* s = &g.surfaces[i];
+        if (!s->tex || s->location != location || abs < s->offset) continue;
+        if (s->pitch && s->pitch != pitch) continue;
+        const u32 bpt = s->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
+        const u32 d = abs - s->offset, y = d / pitch, xb = d % pitch;
+        if ((xb % bpt) || ((w * 4u) % bpt)) continue;
+        const u32 x = xb / bpt, wt = w * 4u / bpt;
+        if (x + wt > s->w || y + h > s->h) continue;
+        const int exact = d == 0;
+        if (best >= 0 && (best_exact > exact ||
+                          (best_exact == exact &&
+                           s->last_write_serial <= g.surfaces[best].last_write_serial)))
+            continue;
+        best = (int)i; best_exact = exact; *ox = x; *oy = y; *ow = wt;
+    }
+    return best;
+}
+
+/* Guest byte layout of one row. RGBA8: host R,G,B,A <-> guest A,R,G,B
+ * (decode_texel's order). FP16: four halves R,G,B,A, big-endian in the
+ * guest. Zeta pack: already the guest's A,R,G,B bytes. */
+enum { LD_GUEST_ROW_RGBA8, LD_GUEST_ROW_FP16, LD_GUEST_ROW_RAW };
+static void ld_guest_row_out(u8* dst, const u8* src, u32 texels, int kind)
+{
+    if (kind == LD_GUEST_ROW_RAW) { memcpy(dst, src, (size_t)texels * 4u); return; }
+    /* Word-wise, so the compiler vectorises both: several megabytes a frame
+     * go through here. Host is little-endian. */
+    if (kind == LD_GUEST_ROW_FP16) {
+        for (u32 c = 0; c < texels * 4u; c++) {
+            u16 v; memcpy(&v, src + 2u * c, 2);
+            v = (u16)((v << 8) | (v >> 8));
+            memcpy(dst + 2u * c, &v, 2);
+        }
+        return;
+    }
+    for (u32 x = 0; x < texels; x++) {       /* R,G,B,A -> A,R,G,B */
+        u32 v; memcpy(&v, src + 4u * x, 4);
+        v = (v << 8) | (v >> 24);
+        memcpy(dst + 4u * x, &v, 4);
+    }
+}
+static void ld_guest_row_in(u8* dst, const u8* src, u32 texels, int kind)
+{
+    if (kind == LD_GUEST_ROW_FP16) { ld_guest_row_out(dst, src, texels, kind); return; }  /* a swap is its own inverse */
+    for (u32 x = 0; x < texels; x++) {       /* A,R,G,B -> R,G,B,A */
+        u32 v; memcpy(&v, src + 4u * x, 4);
+        v = (v >> 8) | (v << 24);
+        memcpy(dst + 4u * x, &v, 4);
+    }
+}
+
+static ID3D12Resource* ld_guest_buffer(D3D12_HEAP_TYPE type, UINT64 bytes)
+{
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = type;
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = bytes;
+    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* buffer = NULL;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+            type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
+                                             : D3D12_RESOURCE_STATE_GENERIC_READ,
+            NULL, &IID_ID3D12Resource, (void**)&buffer)))
+        return NULL;
+    return buffer;
+}
+
+/* Read-back buffer of rsx_live_draw_guest_read, kept between calls: every use
+ * ends with a flush that waits for the GPU, so nothing still refers to it
+ * when the next call starts. Released in rsx_live_draw_shutdown. */
+static ID3D12Resource* s_guest_rb;
+static UINT64          s_guest_rb_bytes;
+
+/* What guest memory already holds of each resource NV3089 reads out.
+ *
+ * A read-back costs a GPU wait, and the first version paid one per call:
+ * every blit arrives as two strips (1024 + 256 columns), four or five blits a
+ * frame, menus included. Three things cut that to about one wait a frame:
+ *  - a read-back covers whole surface rows, so the second strip of a blit
+ *    finds its bytes already written;
+ *  - each source remembers the write stamp it was read back at, and a
+ *    transfer of rows that are still current does nothing;
+ *  - when one source has to be read back, every other source a transfer used
+ *    this frame or the last and that has changed since is read back in the
+ *    same submission (the blits of a frame come in a run, after the draws).
+ * Writing a source early is harmless: the bytes are the surface's own, in
+ * the place the guest keeps them; if it is drawn again before its transfer,
+ * the stamp differs and it is read back again. */
+typedef struct {
+    int kind;                 /* 0 = free, 1 = colour surface, 2 = zeta */
+    u32 index;
+    ID3D12Resource* res;      /* the resource read back (a recreated one is a miss) */
+    u64 stamp;                /* its write stamp at that moment */
+    u32 pitch;                /* guest row pitch the rows were written at */
+    u32 x0, x1, y0, y1;       /* texels of it that guest memory holds */
+    u32 frame;                /* last frame a transfer read it */
+    /* LD_NV3089_LAG: a copy recorded but not waited for. It is delivered to
+     * guest memory by a later transfer of the same source, once the list
+     * that carries it has been fenced. */
+    ID3D12Resource* pend_buf; /* read-back buffer of this source */
+    UINT64 pend_bytes;
+    int pend_issued;          /* pend_buf has a copy in flight (or landed, undelivered) */
+    u64 pend_fence;           /* fence value that completes it */
+    ID3D12Resource* pend_res; /* what was copied, and its stamp then */
+    u64 pend_stamp;
+    u32 pend_pitch, pend_base, pend_texel, pend_rb_pitch;
+    int pend_row_kind;
+    u32 px0, px1, py0, py1;
+} ld_guest_src;
+#define LD_GUEST_SRCS 8
+static ld_guest_src s_guest_src[LD_GUEST_SRCS];
+static struct {
+    u64 reads, cached, flushes, batched, uploads, wait_qpc, copy_qpc;
+    u64 lag_issued, lag_delivered, lag_qpc, wrote_qpc;
+} s_guest_stats;
+
+/* LD_NV3089_LAG (default 0). 1 = never wait for the GPU in a transfer: the
+ * read-back of a source is recorded and left to complete with the frame's
+ * normal submissions, and guest memory receives it at the next transfer of
+ * that source -- one scene late. The default (0) is exact: guest memory holds
+ * the current surface before the guest copy runs, at the price of one GPU
+ * wait per scene. Whether the title tolerates the late data is what the
+ * switch is for; it already composes with the previous frame's layer. */
+static int ld_nv3089_lag(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("LD_NV3089_LAG");
+        on = e ? atoi(e) != 0 : 0;
+        fprintf(stderr, "[nv3089-guest] LD_NV3089_LAG=%d: read-backs %s\n", on,
+                on ? "delivered one transfer late, no GPU wait"
+                   : "waited for (exact)");
+    }
+    return on;
+}
+static void ld_guest_src_drop(ld_guest_src* e)
+{
+    if (e->pend_buf) retire_texture(e->pend_buf);   /* a copy into it may still be recorded */
+    memset(e, 0, sizeof(*e));
+}
+static void ld_guest_totals(void)
+{
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const double ms = 1000.0 / (double)f.QuadPart;
+    fprintf(stderr, "[nv3089-guest] frame %u totals: transfers read=%llu already current=%llu "
+                    "GPU waits=%llu (+%llu sources batched) uploads=%llu wait=%.1f ms "
+                    "copy=%.1f ms per wait | lag issued=%llu delivered=%llu %.2f ms each | "
+                    "uploads %.2f ms each\n",
+            g_ld_frames, (unsigned long long)s_guest_stats.reads,
+            (unsigned long long)s_guest_stats.cached,
+            (unsigned long long)s_guest_stats.flushes,
+            (unsigned long long)s_guest_stats.batched,
+            (unsigned long long)s_guest_stats.uploads,
+            s_guest_stats.flushes ? ms * (double)s_guest_stats.wait_qpc / (double)s_guest_stats.flushes : 0.0,
+            s_guest_stats.flushes ? ms * (double)s_guest_stats.copy_qpc / (double)s_guest_stats.flushes : 0.0,
+            (unsigned long long)s_guest_stats.lag_issued,
+            (unsigned long long)s_guest_stats.lag_delivered,
+            s_guest_stats.lag_issued ? ms * (double)s_guest_stats.lag_qpc / (double)s_guest_stats.lag_issued : 0.0,
+            s_guest_stats.uploads ? ms * (double)s_guest_stats.wrote_qpc / (double)s_guest_stats.uploads : 0.0);
+}
+
+static u64 ld_guest_qpc(void)
+{
+    LARGE_INTEGER t; QueryPerformanceCounter(&t); return (u64)t.QuadPart;
+}
+
+/* Current resource, write stamp and size (texels) of a source, or 0 when it
+ * is gone. */
+static int ld_guest_src_now(int kind, u32 index, ID3D12Resource** res, u64* stamp,
+                            u32* w, u32* h)
+{
+    if (kind == 1) {
+        if (index >= g.n_surfaces || !g.surfaces[index].tex) return 0;
+        *res = g.surfaces[index].tex; *stamp = g.surfaces[index].last_write_serial;
+        *w = g.surfaces[index].w; *h = g.surfaces[index].h;
+        return 1;
+    }
+    if (kind == 2) {
+        if (index >= g.n_zdepths || !g.zdepths[index].pack) return 0;
+        *res = g.zdepths[index].pack; *stamp = g.zdepths[index].write_gen;
+        *w = g.zdepths[index].snapshot_w; *h = g.zdepths[index].snapshot_h;
+        return 1;
+    }
+    return 0;
+}
+
+/* Bring a zeta's pack up to date for a read-back. A zeta that was only
+ * cleared has no published snapshot (texture binds read guest memory for
+ * those, on purpose), but the transfer wants what the buffer holds -- the
+ * clear value -- so resolve it once and leave the flags as they were. */
+static int ld_guest_zeta_ready(u32 i)
+{
+    zdepth_t* z = &g.zdepths[i];
+    if (!z->tex || !z->snapshot || !z->pack) return 0;
+    if (z->had_write || z->snapshot_valid)
+        return zdepth_snapshot(1u + i) && z->pack;
+    if (!z->cleared) return 0;       /* never bound to anything: no content */
+    z->had_write = 1;
+    const int ok = zdepth_snapshot(1u + i) && z->pack;
+    z->had_write = 0; z->snapshot_valid = 0;
+    return ok;
+}
+
+void rsx_live_draw_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h,
+                              u32 dst_location)
+{
+    /* Local source on its way to main memory only: a local -> local copy is
+     * done on the GPU (ld_blit_gpu), and this renderer keeps no main-memory
+     * surface whose pixels guest memory lacks. */
+    if (!g.ready || !pitch || !w || !h || location != 0u || dst_location != 1u ||
+        !ld_nv3089_guest())
+        return;
+    s_guest_stats.reads++;
+    int kind = 0; u32 index = 0;
+    u32 x = 0, y = 0, wt = w;
+    /* A zeta first: the colour surface at a zeta's address, when there is
+     * one, is the nominal target of colourless passes (ld_ct_select) and
+     * holds nothing. The byte must be inside the zeta's own rows at the
+     * zeta's own pitch (see ld_guest_surface). The pack is the Z24S8 word as
+     * the guest stores it. */
+    for (u32 i = 0; i < g.n_zdepths && !kind; i++) {
+        const zdepth_t* z = &g.zdepths[i];
+        if (z->location != location || offset < z->offset || !z->pack) continue;
+        const u32 zp = z->pitch ? z->pitch : z->snapshot_w * 4u;
+        if (zp != pitch) continue;
+        const u32 d = offset - z->offset, zy = d / pitch, zx = (d % pitch) / 4u;
+        if ((d % pitch) % 4u || zx + w > z->snapshot_w || zy + h > z->snapshot_h) continue;
+        kind = 2; index = i; x = zx; y = zy; wt = w;
+    }
+    if (!kind) {
+        const int si = ld_guest_surface(location, offset, pitch, w, h, &x, &y, &wt);
+        if (si >= 0 && !(g.surfaces[si].ct0_ghost && !g.surfaces[si].last_write_serial)) {
+            kind = 1; index = (u32)si;
+        }
+    }
+    if (!kind) {
+        /* Not on the GPU: guest memory already is the source. */
+        static u32 n;
+        if (PS3_LOG_FIRST(n, 8))
+            fprintf(stderr, "[nv3089-guest] frame %u read %u:0x%X/%u %ux%u: no live surface or "
+                            "zeta, guest memory used as is\n",
+                    g_ld_frames, location, offset, pitch, w, h);
+        return;
+    }
+
+    /* The source's entry: its own, else a free one, else the stalest. */
+    ld_guest_src* e = NULL;
+    for (u32 k = 0; k < LD_GUEST_SRCS; k++)
+        if (s_guest_src[k].kind == kind && s_guest_src[k].index == index) { e = &s_guest_src[k]; break; }
+    if (!e) {
+        e = &s_guest_src[0];
+        for (u32 k = 0; k < LD_GUEST_SRCS; k++) {
+            if (!s_guest_src[k].kind) { e = &s_guest_src[k]; break; }
+            if (s_guest_src[k].frame < e->frame) e = &s_guest_src[k];
+        }
+        ld_guest_src_drop(e);
+        e->kind = kind; e->index = index;
+    }
+    ID3D12Resource* res = NULL; u64 stamp = 0; u32 rw = 0, rh = 0;
+    if (!ld_guest_src_now(kind, index, &res, &stamp, &rw, &rh)) return;
+    e->frame = g_ld_frames;
+    if (e->res == res && e->stamp == stamp && e->pitch == pitch &&
+        x >= e->x0 && x + wt <= e->x1 && y >= e->y0 && y + h <= e->y1) {
+        s_guest_stats.cached++;      /* guest memory already holds these rows */
+        return;
+    }
+    /* Rows to read back: the transfer's rectangle joined with what the entry
+     * held when that is the same layout, so after the first frame the two
+     * strips and the repeats settle on one rectangle and one read-back --
+     * and no more than the game reads (the HDR target gives up only its
+     * 640x352 corner). */
+    {
+        const u32 texel = kind == 1 && g.surfaces[index].fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
+        u32 nx0 = x, nx1 = x + wt, ny0 = y, ny1 = y + h;
+        /* Whole surface rows when the guest pitch has room for them. Reading
+         * back only the transfer's own columns (tried for run69, to spare the
+         * half of the HDR rows the blit does not copy) left the display
+         * striped with layers A and B intact on the GPU, so something reads
+         * those rows of local memory beyond what the transfer names. */
+        if ((u64)rw * texel <= pitch) { nx0 = 0; nx1 = rw; }
+        if (e->res == res && e->pitch == pitch && e->y1 > e->y0 && e->y1 <= rh && e->x1 <= rw) {
+            if (e->x0 < nx0) nx0 = e->x0;
+            if (e->x1 > nx1) nx1 = e->x1;
+            if (e->y0 < ny0) ny0 = e->y0;
+            if (e->y1 > ny1) ny1 = e->y1;
+        }
+        e->res = NULL;               /* (re)read below */
+        e->pitch = pitch; e->x0 = nx0; e->x1 = nx1; e->y0 = ny0; e->y1 = ny1;
+    }
+
+    if (ld_nv3089_lag()) {
+        const u64 t0 = ld_guest_qpc();
+        /* Deliver the copy issued by an earlier transfer, if its list has
+         * been executed and fenced since (every ld_flush waits). */
+        if (e->pend_issued && e->pend_buf &&
+            g.fence->lpVtbl->GetCompletedValue(g.fence) >= e->pend_fence) {
+            const u32 n = e->px1 - e->px0, bytes = n * e->pend_texel;
+            const UINT64 span = (UINT64)e->pend_rb_pitch * (e->py1 - e->py0);
+            u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)span};
+            if (SUCCEEDED(e->pend_buf->lpVtbl->Map(e->pend_buf, 0, &rr, (void**)&px))) {
+                for (u32 r = e->py0; r < e->py1; r++) {
+                    u8* out = (u8*)guest_ptr(0u, e->pend_base + r * e->pend_pitch +
+                                                 e->px0 * e->pend_texel, bytes);
+                    if (!out) break;
+                    ld_guest_row_out(out, px + (SIZE_T)(r - e->py0) * e->pend_rb_pitch, n,
+                                     e->pend_row_kind);
+                }
+                D3D12_RANGE none = {0, 0};
+                e->pend_buf->lpVtbl->Unmap(e->pend_buf, 0, &none);
+                s_guest_stats.lag_delivered++;
+            }
+            e->pend_issued = 0;
+        }
+        /* Issue a copy of what the source holds now, unless one is in flight
+         * or this very content was the last one issued (the second strip of
+         * a blit). */
+        if (!e->pend_issued &&
+            !(e->pend_res == res && e->pend_stamp == stamp && e->pend_pitch == pitch &&
+              e->px0 <= e->x0 && e->px1 >= e->x1 && e->py0 <= e->y0 && e->py1 >= e->y1) &&
+            (kind != 2 || ld_guest_zeta_ready(index))) {
+            ID3D12Resource* from; D3D12_RESOURCE_STATES state; DXGI_FORMAT fmt;
+            if (kind == 2) {
+                const zdepth_t* z = &g.zdepths[index];
+                from = z->pack; state = z->pack_state; fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+                e->pend_row_kind = LD_GUEST_ROW_RAW; e->pend_base = z->offset;
+            } else {
+                const surface_t* sf = &g.surfaces[index];
+                from = sf->tex; state = D3D12_RESOURCE_STATE_RENDER_TARGET; fmt = sf->fmt;
+                e->pend_row_kind = fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? LD_GUEST_ROW_FP16
+                                                                          : LD_GUEST_ROW_RGBA8;
+                e->pend_base = sf->offset;
+            }
+            e->pend_texel = e->pend_row_kind == LD_GUEST_ROW_FP16 ? 8u : 4u;
+            e->pend_rb_pitch = ((e->x1 - e->x0) * e->pend_texel + 255u) & ~255u;
+            const UINT64 need = (UINT64)e->pend_rb_pitch * (e->y1 - e->y0);
+            if (!e->pend_buf || e->pend_bytes < need) {
+                if (e->pend_buf) e->pend_buf->lpVtbl->Release(e->pend_buf);   /* nothing in flight */
+                e->pend_buf = ld_guest_buffer(D3D12_HEAP_TYPE_READBACK, need);
+                e->pend_bytes = e->pend_buf ? need : 0;
+            }
+            if (e->pend_buf) {
+                D3D12_RESOURCE_BARRIER b = {0};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = from;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = state;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+                D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
+                src.pResource = from; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dst.pResource = e->pend_buf; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                dst.PlacedFootprint.Footprint.Format = fmt;
+                dst.PlacedFootprint.Footprint.Width = e->x1 - e->x0;
+                dst.PlacedFootprint.Footprint.Height = e->y1 - e->y0;
+                dst.PlacedFootprint.Footprint.Depth = 1;
+                dst.PlacedFootprint.Footprint.RowPitch = e->pend_rb_pitch;
+                D3D12_BOX box = { e->x0, e->y0, 0, e->x1, e->y1, 1 };
+                g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, &box);
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                b.Transition.StateAfter = state;
+                g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+                e->pend_issued = 1;
+                e->pend_fence = g.fence_value + 1u;      /* the next ld_flush signals it */
+                e->pend_res = res; e->pend_stamp = stamp; e->pend_pitch = pitch;
+                e->px0 = e->x0; e->px1 = e->x1; e->py0 = e->y0; e->py1 = e->y1;
+                s_guest_stats.lag_issued++;
+                if ((s_guest_stats.lag_issued & 2047u) == 0) ld_guest_totals();
+            }
+        }
+        s_guest_stats.lag_qpc += ld_guest_qpc() - t0;
+        return;
+    }
+
+    /* The batch: this source, and every other recently used one that is no
+     * longer current. */
+    struct {
+        ld_guest_src* e; ID3D12Resource* res; D3D12_RESOURCE_STATES state; DXGI_FORMAT fmt;
+        int row_kind; u32 texel, rb_pitch, base; u64 stamp; UINT64 at;
+    } job[LD_GUEST_SRCS];
+    u32 n_jobs = 0;
+    UINT64 total = 0;
+    for (u32 k = 0; k < LD_GUEST_SRCS; k++) {
+        ld_guest_src* c = &s_guest_src[k];
+        if (!c->kind || c->y1 <= c->y0 || c->x1 <= c->x0) continue;
+        ID3D12Resource* cres = NULL; u64 cstamp = 0; u32 cw = 0, ch = 0;
+        if (!ld_guest_src_now(c->kind, c->index, &cres, &cstamp, &cw, &ch)) { ld_guest_src_drop(c); continue; }
+        if (c != e) {
+            if (c->frame + 1u < g_ld_frames) continue;             /* not in use any more */
+            if (c->res == cres && c->stamp == cstamp) continue;    /* current */
+            if (c->x1 > cw || c->y1 > ch) { c->res = NULL; continue; }
+        }
+        if (c->kind == 2 && !ld_guest_zeta_ready(c->index)) {
+            if (c == e) {
+                static u32 n;
+                const zdepth_t* z = &g.zdepths[c->index];
+                if (PS3_LOG_FIRST(n, 8))
+                    fprintf(stderr, "[nv3089-guest] frame %u read %u:0x%X/%u %ux%u: zeta #%u has no "
+                                    "readable depth (written=%d snapshot=%d cleared=%d pack=%d "
+                                    "%ux%u), guest memory used as is\n",
+                            g_ld_frames, location, offset, pitch, w, h, c->index, z->had_write,
+                            z->snapshot_valid, z->cleared, z->pack != NULL,
+                            z->snapshot_w, z->snapshot_h);
+            }
+            continue;
+        }
+        /* zdepth_snapshot may have replaced nothing, but read the state after it */
+        job[n_jobs].e = c;
+        if (c->kind == 2) {
+            const zdepth_t* z = &g.zdepths[c->index];
+            job[n_jobs].res = z->pack; job[n_jobs].state = z->pack_state;
+            job[n_jobs].fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+            job[n_jobs].row_kind = LD_GUEST_ROW_RAW; job[n_jobs].base = z->offset;
+        } else {
+            const surface_t* sf = &g.surfaces[c->index];
+            job[n_jobs].res = sf->tex; job[n_jobs].state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            job[n_jobs].fmt = sf->fmt;
+            job[n_jobs].row_kind = sf->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? LD_GUEST_ROW_FP16
+                                                                              : LD_GUEST_ROW_RGBA8;
+            job[n_jobs].base = sf->offset;
+        }
+        job[n_jobs].texel = job[n_jobs].row_kind == LD_GUEST_ROW_FP16 ? 8u : 4u;
+        job[n_jobs].rb_pitch = ((c->x1 - c->x0) * job[n_jobs].texel + 255u) & ~255u;   /* 256-align */
+        job[n_jobs].stamp = cstamp;
+        job[n_jobs].at = total;
+        total += ((UINT64)job[n_jobs].rb_pitch * (c->y1 - c->y0) + 511u) & ~(UINT64)511u;  /* 512-align */
+        n_jobs++;
+    }
+    if (!n_jobs) return;
+    if (!s_guest_rb || s_guest_rb_bytes < total) {
+        if (s_guest_rb) s_guest_rb->lpVtbl->Release(s_guest_rb);
+        s_guest_rb = ld_guest_buffer(D3D12_HEAP_TYPE_READBACK, total);
+        s_guest_rb_bytes = s_guest_rb ? total : 0;
+        if (!s_guest_rb) return;
+    }
+    for (u32 j = 0; j < n_jobs; j++) {
+        const ld_guest_src* c = job[j].e;
+        D3D12_RESOURCE_BARRIER b = {0};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = job[j].res;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = job[j].state;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+        D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
+        src.pResource = job[j].res; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.pResource = s_guest_rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = job[j].at;
+        dst.PlacedFootprint.Footprint.Format = job[j].fmt;
+        dst.PlacedFootprint.Footprint.Width = c->x1 - c->x0;
+        dst.PlacedFootprint.Footprint.Height = c->y1 - c->y0;
+        dst.PlacedFootprint.Footprint.Depth = 1;
+        dst.PlacedFootprint.Footprint.RowPitch = job[j].rb_pitch;
+        D3D12_BOX box = { c->x0, c->y0, 0, c->x1, c->y1, 1 };
+        g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, &box);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.StateAfter = job[j].state;
+        g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    }
+    const u64 t0 = ld_guest_qpc();
+    ld_flush(LD_FLUSH_READBACK);                   /* the copies complete on the GPU */
+    const u64 t1 = ld_guest_qpc();
+    s_guest_stats.flushes++;
+    s_guest_stats.batched += n_jobs - 1u;
+    s_guest_stats.wait_qpc += t1 - t0;
+    if (!g.ready) return;
+
+    u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)total};
+    if (FAILED(s_guest_rb->lpVtbl->Map(s_guest_rb, 0, &rr, (void**)&px))) return;
+    for (u32 j = 0; j < n_jobs; j++) {
+        ld_guest_src* c = job[j].e;
+        const u32 n = c->x1 - c->x0, bytes = n * job[j].texel;
+        u32 rows = 0; u64 nonzero = 0;
+        for (u32 r = c->y0; r < c->y1; r++, rows++) {
+            u8* out = (u8*)guest_ptr(0u, job[j].base + r * c->pitch + c->x0 * job[j].texel, bytes);
+            if (!out) break;
+            const u8* in = px + (SIZE_T)job[j].at + (SIZE_T)(r - c->y0) * job[j].rb_pitch;
+            ld_guest_row_out(out, in, n, job[j].row_kind);
+            if (r == c->y0 + (c->y1 - c->y0) / 2u)        /* one row is enough for the log */
+                for (u32 k = 0; k < bytes; k++) nonzero += in[k] != 0;
+        }
+        if (rows == c->y1 - c->y0) { c->res = job[j].res; c->stamp = job[j].stamp; }
+        /* The first reads, then one in 512: the first ones fall in the frame
+         * that created the surfaces, when they are still empty. */
+        { static u32 n_log;
+          n_log++;
+          if (n_log <= 12u || (n_log & 511u) == 0)
+              fprintf(stderr, "[nv3089-guest] frame %u read-back %s %u (0:0x%X/%u) texels %u..%u x "
+                              "%u..%u of %u bytes%s: %u rows to guest memory, mid-row non-zero bytes "
+                              "%llu of %u\n",
+                      g_ld_frames, c->kind == 2 ? "zeta" : "surface", c->index, job[j].base,
+                      c->pitch, c->x0, c->x1, c->y0, c->y1, job[j].texel,
+                      c == e ? "" : " (batched)", rows, (unsigned long long)nonzero, bytes); }
+        if (s_csv_file && s_csv_gate_open)
+            fprintf(s_csv_file, "#guest_read,%u,0:0x%X/%u,%u..%ux%u..%u,%s=%u,rows=%u%s\n", g_ld_frames,
+                    job[j].base, c->pitch, c->x0, c->x1, c->y0, c->y1,
+                    c->kind == 2 ? "zeta" : "surf", c->index, rows, c == e ? "" : ",batched");
+    }
+    D3D12_RANGE none = {0, 0};
+    s_guest_rb->lpVtbl->Unmap(s_guest_rb, 0, &none);
+    s_guest_stats.copy_qpc += ld_guest_qpc() - t1;
+    if (s_csv_file && s_csv_gate_open) fflush(s_csv_file);
+    /* Where the time goes, once every 512 submissions. */
+    if ((s_guest_stats.flushes & 511u) == 0) ld_guest_totals();
+}
+
+void rsx_live_draw_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h,
+                               u32 src_location)
+{
+    /* Main memory into a local live surface only: what a local -> local copy
+     * writes is already there (GPU copy), and a main-memory destination is
+     * plain guest memory for this renderer. */
+    if (!g.ready || !pitch || !w || !h || location != 0u || src_location != 1u ||
+        !ld_nv3089_guest())
+        return;
+    u32 x = 0, y = 0, wt = w;
+    const int di = ld_guest_surface(location, offset, pitch, w, h, &x, &y, &wt);
+    if (di < 0) {
+        /* No surface: a later bind of this address reads guest memory, which
+         * now holds the pixels. */
+        static u32 n;
+        if (PS3_LOG_FIRST(n, 8))
+            fprintf(stderr, "[nv3089-guest] wrote %u:0x%X/%u %ux%u: no live surface, nothing "
+                            "to upload\n", location, offset, pitch, w, h);
+        return;
+    }
+    surface_t* s = &g.surfaces[di];
+    const u64 wrote_t0 = ld_guest_qpc();
+    const int kind = s->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? LD_GUEST_ROW_FP16
+                                                              : LD_GUEST_ROW_RGBA8;
+    const u32 texel = kind == LD_GUEST_ROW_FP16 ? 8u : 4u;
+    const u32 up_pitch = (wt * texel + 255u) & ~255u;
+    /* One buffer per upload: the copy is only recorded here, and the strips
+     * of one blit (1024 + 256 columns) arrive before the list is flushed. */
+    ID3D12Resource* up = ld_guest_buffer(D3D12_HEAP_TYPE_UPLOAD, (UINT64)up_pitch * h);
+    if (!up) return;
+    u8* px = NULL; D3D12_RANGE none = {0, 0};
+    if (FAILED(up->lpVtbl->Map(up, 0, &none, (void**)&px))) { up->lpVtbl->Release(up); return; }
+    u32 rows = 0;
+    for (; rows < h; rows++) {
+        const u8* in = guest_ptr(location, offset + rows * pitch, w * 4u);
+        if (!in) break;
+        ld_guest_row_in(px + (SIZE_T)rows * up_pitch, in, wt, kind);
+    }
+    up->lpVtbl->Unmap(up, 0, NULL);
+    if (rows) {
+        D3D12_RESOURCE_BARRIER b = {0};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = s->tex;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+        D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
+        dst.pResource = s->tex; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.pResource = up; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Footprint.Format = s->fmt;
+        src.PlacedFootprint.Footprint.Width = wt;
+        src.PlacedFootprint.Footprint.Height = rows;
+        src.PlacedFootprint.Footprint.Depth = 1;
+        src.PlacedFootprint.Footprint.RowPitch = up_pitch;
+        g.list->lpVtbl->CopyTextureRegion(g.list, &dst, x, y, 0, &src, NULL);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+        const u64 before = s->last_write_serial;
+        ld_surface_note_write((u32)di, LD_SURFACE_WRITE_BLIT);
+        /* The surface now holds exactly what guest memory holds in that
+         * rectangle: if guest memory was current for the rest of it, it still
+         * is, and the next transfer out of it needs no read-back. */
+        for (u32 k = 0; k < LD_GUEST_SRCS; k++) {
+            ld_guest_src* c = &s_guest_src[k];
+            if (c->kind == 1 && c->index == (u32)di && c->res == s->tex && c->stamp == before &&
+                c->pitch == pitch && rows == h &&
+                x >= c->x0 && x + wt <= c->x1 && y >= c->y0 && y + h <= c->y1)
+                c->stamp = s->last_write_serial;
+        }
+        s_guest_stats.uploads++;
+    }
+    retire_texture(up);              /* released once the list that copies from it is fenced */
+    s_guest_stats.wrote_qpc += ld_guest_qpc() - wrote_t0;
+    { static u32 n;
+      n++;
+      if (n <= 6u || (n & 1023u) == 0)
+          fprintf(stderr, "[nv3089-guest] frame %u wrote %u:0x%X/%u %ux%u -> surface %d (0x%X) at "
+                          "%u,%u %ux%u texels of %u bytes: %u rows uploaded from guest memory\n",
+                  g_ld_frames, location, offset, pitch, w, h, di, s->offset, x, y, wt, h,
+                  texel, rows); }
+    if (s_csv_file && s_csv_gate_open) {
+        fprintf(s_csv_file, "#guest_wrote,%u,%u:0x%X/%u,%ux%u,surf=%d,rows=%u\n", g_ld_frames,
+                location, offset, pitch, w, h, di, rows);
+        fflush(s_csv_file);
+    }
+}
+
 static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
                        u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h);
 int rsx_live_draw_blit(u32 src_loc, u32 src_abs, u32 src_pitch,
@@ -3916,6 +4566,12 @@ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
                        u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h)
 {
     if (!g.ready || !src_pitch || !dst_pitch || !w || !h) return 0;
+    /* A copy with an end in main memory goes through guest memory instead
+     * (rsx_live_draw_guest_read / _wrote): the CPU or an SPU works on those
+     * bytes, and a live surface made here for the main-memory side would hide
+     * whatever they write from later texture binds. Only local -> local stays
+     * a GPU copy. */
+    if (ld_nv3089_guest() && (src_loc == 1u || dst_loc == 1u)) return -6;
     u32 sx, sy, dx = 0, dy = 0;
     const int si = surface_containing(src_loc, src_abs, src_pitch, w, h, &sx, &sy);
     if (si < 0) return -1;            /* source is not a live surface */
@@ -8784,6 +9440,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         decode_render_state(&depth_state);
         zdepth_t* z = &g.zdepths[current_zslot - 1];
         z->draws++;
+        z->write_gen++;
+        z->pitch = sf.zeta_pitch;
         if (depth_state.depth_test) z->depth_test_draws++;
         if (depth_state.depth_write) z->depth_write_draws++;
         if (depth_state.depth_test && depth_state.depth_write)
@@ -8948,6 +9606,8 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         }
         if (zslot) {
             g.zdepths[zslot - 1].cleared = 1;
+            g.zdepths[zslot - 1].write_gen++;
+            g.zdepths[zslot - 1].pitch = sf.zeta_pitch;
             if (mask & RSX_CLEAR_DEPTH) {
                 g.zdepths[zslot - 1].had_write = 0;
                 /* Each guest zeta owns a distinct live resource.  A clear
@@ -11477,6 +12137,10 @@ void rsx_live_draw_shutdown(void)
         g_ld_profile.adapter = NULL;
     }
 #endif
+    if (s_guest_rb) { s_guest_rb->lpVtbl->Release(s_guest_rb); s_guest_rb = NULL; s_guest_rb_bytes = 0; }
+    for (u32 k = 0; k < LD_GUEST_SRCS; k++)
+        if (s_guest_src[k].pend_buf) s_guest_src[k].pend_buf->lpVtbl->Release(s_guest_src[k].pend_buf);
+    memset(s_guest_src, 0, sizeof(s_guest_src));
     if (g.list1) g.list1->lpVtbl->Release(g.list1);
     if (g.dev2) g.dev2->lpVtbl->Release(g.dev2);
     if (g.dev) g.dev->lpVtbl->Release(g.dev);

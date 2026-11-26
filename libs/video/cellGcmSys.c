@@ -1279,24 +1279,45 @@ static inline u64 nv3089_origin(u32 p) { return (u64)p << 16; }
  * with NV3089 is not in guest memory, and what it copies in never reaches the
  * engine's surfaces. Around the guest-memory copy below: write the source
  * rectangle back from any engine surface first, and push the written
- * rectangle into any engine surface after. 32-bit pixels only. */
+ * rectangle into any engine surface after. 32-bit pixels only.
+ *
+ * The live renderer has the same gap and takes the same two calls
+ * (rsx_live_draw_guest_read / _wrote, LD_NV3089_GUEST); it also wants the
+ * other end of the copy, because it keeps local -> local copies on the GPU. */
 static void nv3089_engine_read(u32 in_pitch, u32 out_w, u32 out_h)
 {
-    if (!rsx_draw_engine_enabled() || !out_w || !out_h) return;
+    const int live = !rsx_draw_engine_enabled() && rsx_live_draw_enabled();
+    if ((!rsx_draw_engine_enabled() && !live) || !out_w || !out_h) return;
     const u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 */
     const u32 sx0 = (u32)(nv3089_origin(u0) >> 20), sy0 = (u32)(nv3089_origin(v0) >> 20);
     const u32 sx1 = (u32)((nv3089_origin(u0) + (u64)(out_w - 1) * s_nv3089.ds_dx) >> 20);
     const u32 sy1 = (u32)((nv3089_origin(v0) + (u64)(out_h - 1) * s_nv3089.dt_dy) >> 20);
     if (sx1 < sx0 || sy1 < sy0) return;
     const u32 loc = (s_nv3089.src_dma != 0xFEED0001u) ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+    if (live) {
+        /* A swizzled (NV309E) destination is written by the guest copy only,
+         * so it counts as main memory: the source must be read back. */
+        const u32 dloc = (!s_nv309e.active && s_gcm2d.dst_dma != 0xFEED0001u)
+                             ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+        rsx_live_draw_guest_read(loc, s_nv3089.in_off + sy0 * in_pitch + sx0 * 4u, in_pitch,
+                                 sx1 - sx0 + 1u, sy1 - sy0 + 1u, dloc);
+        return;
+    }
     rsx_draw_engine_guest_read(loc, s_nv3089.in_off + sy0 * in_pitch + sx0 * 4u, in_pitch,
                                sx1 - sx0 + 1u, sy1 - sy0 + 1u);
 }
 
 static void nv3089_engine_wrote(u32 dst_pitch, u32 x0, u32 y0, u32 x1, u32 y1)
 {
-    if (!rsx_draw_engine_enabled() || x1 <= x0 || y1 <= y0) return;
+    const int live = !rsx_draw_engine_enabled() && rsx_live_draw_enabled();
+    if ((!rsx_draw_engine_enabled() && !live) || x1 <= x0 || y1 <= y0) return;
     const u32 loc = (s_gcm2d.dst_dma != 0xFEED0001u) ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+    if (live) {
+        const u32 sloc = (s_nv3089.src_dma != 0xFEED0001u) ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+        rsx_live_draw_guest_wrote(loc, s_gcm2d.dst_offset + y0 * dst_pitch + x0 * 4u, dst_pitch,
+                                  x1 - x0, y1 - y0, sloc);
+        return;
+    }
     rsx_draw_engine_guest_wrote(loc, s_gcm2d.dst_offset + y0 * dst_pitch + x0 * 4u, dst_pitch,
                                 x1 - x0, y1 - y0);
 }
