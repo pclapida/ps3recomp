@@ -46,6 +46,8 @@ int  rsx_live_draw_blit(u32 sl, u32 sa, u32 sp, u32 dl, u32 da, u32 dp, u32 w, u
 void rsx_live_draw_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h, u32 d)
 { (void)l; (void)o; (void)p; (void)w; (void)h; (void)d; }
 void rsx_live_draw_set_present_interval(int interval) { (void)interval; }
+void rsx_live_draw_flip_snapshot(u32 b) { (void)b; }
+int  rsx_live_draw_present_snapshot(void) { return 0; }
 void rsx_live_draw_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h, u32 sl)
 { (void)l; (void)o; (void)p; (void)w; (void)h; (void)sl; }
 int  rsx_live_draw_resolve_blit(u32 sl, u32 sa, u32 sp, u32 ds, u32 dt, u32 dl, u32 da,
@@ -10904,6 +10906,94 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
     fflush(stderr);
 }
 
+/* Flip snapshots (GCM_PRESENT_SNAPSHOT, see cellGcm_set_present_snapshot).
+ *
+ * Twisted Metal draws ~11 scenes a second and the old present gate (FIFO
+ * drained to put) showed ~3 of them. Stopping the FIFO walker at each flip to
+ * present showed all of them and broke the picture: the title's composite
+ * goes through main memory and depends on the walker's pacing. So the walker
+ * is left exactly as it was, and at each flip it only RECORDS a copy of the
+ * flipped display buffer into one of a small ring of textures -- no flush, no
+ * wait. The host's present loop then shows the newest copy whenever it gets
+ * control. A copy overwritten before it was shown is a coalesced flip.
+ *
+ * The ring entries are ordinary live surfaces under locations no guest
+ * address has (LD_SNAP_LOCATION + k), so the present path -- stretch, dumps,
+ * recording -- takes them like any other surface and no texture or blit
+ * lookup can ever match them. */
+#define LD_SNAP_RING 3u
+#define LD_SNAP_LOCATION 0x50u
+static struct { u32 slot, buffer_id; u64 seq; } s_snap[LD_SNAP_RING];
+static u32 s_snap_newest;
+static u64 s_snap_seq, s_snap_shown_seq, s_snap_presented, s_snap_coalesced;
+static u32 g_ld_present_force_target = LD_INVALID_SURFACE;
+
+void rsx_live_draw_flip_snapshot(u32 buffer_id)
+{
+    if (!g.ready || buffer_id >= 8 || !g.display_buffers[buffer_id].valid) return;
+    /* The surface a present of this buffer would show (same choice as
+     * rsx_live_draw_present, minus its last-resort fallback). */
+    const display_buffer_t* display = &g.display_buffers[buffer_id];
+    u32 src = LD_INVALID_SURFACE;
+    for (u32 i = 0; i < g.n_surfaces; i++)
+        if (g.surfaces[i].tex && g.surfaces[i].location == display->location &&
+            g.surfaces[i].offset == display->offset) { src = i; break; }
+    if (src == LD_INVALID_SURFACE && display->resolve_src > 0 &&
+        (u32)display->resolve_src <= g.n_surfaces)
+        src = (u32)display->resolve_src - 1u;
+    if (src == LD_INVALID_SURFACE || !g.surfaces[src].tex) return;
+    const u32 k = (u32)(s_snap_seq % LD_SNAP_RING);
+    const u32 w = g.surfaces[src].w, h = g.surfaces[src].h;
+    const DXGI_FORMAT fmt = g.surfaces[src].fmt;
+    const u32 slot = surface_get(LD_SNAP_LOCATION + k, 0u, w, h, fmt);
+    /* surface_get may have grown the table; index again, never keep pointers */
+    if (slot == LD_INVALID_SURFACE || slot == src || !g.surfaces[slot].tex ||
+        g.surfaces[slot].w != w || g.surfaces[slot].h != h || g.surfaces[slot].fmt != fmt)
+        return;
+    D3D12_RESOURCE_BARRIER b[2] = {0};
+    for (int i = 0; i < 2; i++) {
+        b[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[i].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    b[0].Transition.pResource = g.surfaces[src].tex;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.pResource = g.surfaces[slot].tex;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    g.list->lpVtbl->CopyResource(g.list, g.surfaces[slot].tex, g.surfaces[src].tex);
+    for (int i = 0; i < 2; i++) {
+        b[i].Transition.StateBefore = b[i].Transition.StateAfter;
+        b[i].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    ld_surface_note_write(slot, LD_SURFACE_WRITE_COPY);
+    if (s_snap_seq != s_snap_shown_seq) s_snap_coalesced++;   /* the previous one was never shown */
+    s_snap[k].slot = slot; s_snap[k].buffer_id = buffer_id; s_snap[k].seq = ++s_snap_seq;
+    s_snap_newest = k;
+}
+
+/* Present the newest flip snapshot, if there is one that has not been shown.
+ * Returns 1 when a frame was presented. */
+int rsx_live_draw_present_snapshot(void)
+{
+    if (!g.ready || s_snap_seq == s_snap_shown_seq) return 0;
+    const u32 k = s_snap_newest;
+    if (s_snap[k].slot >= g.n_surfaces || !g.surfaces[s_snap[k].slot].tex) {
+        s_snap_shown_seq = s_snap_seq;
+        return 0;
+    }
+    s_snap_shown_seq = s_snap_seq;
+    g_ld_present_force_target = s_snap[k].slot;
+    rsx_live_draw_present(s_snap[k].buffer_id);
+    g_ld_present_force_target = LD_INVALID_SURFACE;
+    s_snap_presented++;
+    if (s_snap_presented == 1ull || (s_snap_presented % 600ull) == 0)
+        fprintf(stderr, "[flip-present] %llu flips presented, %llu coalesced (snapshots)\n",
+                (unsigned long long)s_snap_presented, (unsigned long long)s_snap_coalesced);
+    return 1;
+}
+
 void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
@@ -10973,7 +11063,12 @@ void rsx_live_draw_present(u32 buffer_id)
      * be an offscreen shadow/postprocess surface at that instant; copying it
      * caused a010 to present black despite executing the scene's draws. */
     u32 target = LD_INVALID_SURFACE;
-    if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
+    /* A flip snapshot stands in for the display buffer it was copied from
+     * (rsx_live_draw_present_snapshot). */
+    if (g_ld_present_force_target != LD_INVALID_SURFACE &&
+        g_ld_present_force_target < g.n_surfaces)
+        target = g_ld_present_force_target;
+    if (target == LD_INVALID_SURFACE && buffer_id < 8 && g.display_buffers[buffer_id].valid) {
         const display_buffer_t* display = &g.display_buffers[buffer_id];
         for (u32 i = 0; i < g.n_surfaces; i++) {
             if (g.surfaces[i].location == display->location &&

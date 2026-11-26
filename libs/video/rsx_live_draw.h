@@ -116,6 +116,11 @@ void rsx_live_draw_present(u32 buffer_id);
 /* Present interval chosen by the host (1 = vsync, 0 = immediate), used unless
  * LD_PRESENT_INTERVAL is set. Call before the first present. */
 void rsx_live_draw_set_present_interval(int interval);
+/* Flip snapshots: the FIFO walker records a copy of the flipped display
+ * buffer at each flip (no wait); the host presents the newest one. See
+ * cellGcm_set_present_snapshot. present_snapshot returns 1 when it presented. */
+void rsx_live_draw_flip_snapshot(u32 buffer_id);
+int  rsx_live_draw_present_snapshot(void);
 
 /* Movie playback: while on, the guest method stream is ignored so a host-decoded
  * movie can own the window without the guest's draws racing g.list. */

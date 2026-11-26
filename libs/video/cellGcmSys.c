@@ -1772,6 +1772,119 @@ int cellGcm_take_flip_pending_synced(void)
     return 1;
 }
 
+/* Present every executed flip (cellGcm_set_present_each_flip, off unless the
+ * host turns it on).
+ *
+ * The gate above shows a frame only when the drain has caught up with put.
+ * Twisted Metal never lets it: its main thread keeps writing the next scene
+ * while this one is drained, a scene is far more than GCM_FIFO_CATCHUP_BYTES,
+ * so the walker runs through flip after flip and three to five finished
+ * scenes are drawn for each one that reaches the screen (~11 rendered per
+ * second, ~3 presented).
+ *
+ * With the mode on, the walker stops AT each in-FIFO flip, whatever the
+ * backlog, and holds there: everything the title queued before the flip has
+ * been executed and nothing after it has. The host's present loop takes the
+ * flip with cellGcm_take_flip_pending_each() and presents; that releases the
+ * walker. Flip status, counters and handlers are untouched -- they are driven
+ * from the flip word and the vblank tick as before; only when the picture is
+ * shown changes.
+ *
+ * A host that does not come for the flip (hidden window, backend lost) must
+ * not stall the title: the hold gives up after GCM_FLIP_HOLD_MAX_MS and the
+ * frame is dropped, as every such frame was before. */
+#define GCM_FLIP_HOLD_MAX_MS 250u
+static volatile int s_flip_each = 0;
+static volatile int s_flip_hold = 0;
+static unsigned long long s_flip_hold_since_ms;
+static unsigned long long s_flip_each_presented, s_flip_each_coalesced;
+static u32 s_flip_each_last_request;
+
+/* Flip snapshots (off unless the host turns it on): the walker keeps its
+ * pacing and its get == put present gate untouched, and at each flip it has
+ * the live renderer record a copy of the flipped buffer
+ * (rsx_live_draw_flip_snapshot). The host presents the newest copy with
+ * rsx_live_draw_present_snapshot() instead of the gated present. This is the
+ * replacement for stopping the walker at each flip, which showed every frame
+ * and broke Twisted Metal's main-memory composite. */
+static volatile int s_flip_snapshot = 0;
+void cellGcm_set_present_snapshot(int on)
+{
+    s_flip_snapshot = on ? 1 : 0;
+    fprintf(stderr, "[flip-present] flip snapshots: %s\n",
+            on ? "ON (a copy of the display buffer at each flip; the walker is not stopped)"
+               : "OFF");
+    /* Presents now come up to once per flip, between drains: do not park the
+     * walker thread on a vblank for each. (LD_PRESENT_INTERVAL overrides.) */
+    if (on) rsx_live_draw_set_present_interval(0);
+}
+static void gcm_flip_snapshot(void)
+{
+    if (s_flip_snapshot && rsx_live_draw_enabled())
+        rsx_live_draw_flip_snapshot(s_current_display_buffer_id);
+}
+
+void cellGcm_set_present_each_flip(int on)
+{
+    s_flip_each = on ? 1 : 0;
+    s_flip_hold = 0;
+    /* The walker is parked at the flip until the frame is presented, with
+     * the title's next commands already queued behind it. A vsynced Present
+     * made that park a whole refresh, ten times a second, while the title
+     * waited on get/ref for those commands: run82/83 showed geometry read
+     * from buffers the title had already reused, and loading took half as
+     * long again. Present at once in this mode, so the park lasts only the
+     * flush. (LD_PRESENT_INTERVAL still overrides.) */
+    if (on) rsx_live_draw_set_present_interval(0);
+    fprintf(stderr, "[flip-present] present each executed flip: %s\n",
+            on ? "ON (the walker stops at every flip until it is presented)"
+               : "OFF (present only when the FIFO is drained to put)");
+}
+
+static void gcm_flip_each_count(int presented)
+{
+    /* Flips the title requested since the last one shown, beyond this one. */
+    const u32 req = s_flip_request_count;
+    const u32 d = req - s_flip_each_last_request;
+    s_flip_each_last_request = req;
+    if (presented) s_flip_each_presented++;
+    if (d > (presented ? 1u : 0u)) s_flip_each_coalesced += d - (presented ? 1u : 0u);
+    if (presented && (s_flip_each_presented == 1ull || (s_flip_each_presented % 600ull) == 0))
+        fprintf(stderr, "[flip-present] %llu flips presented, %llu coalesced\n",
+                s_flip_each_presented, s_flip_each_coalesced);
+}
+
+/* The host's present gate in that mode: 1 = present now. */
+int cellGcm_take_flip_pending_each(void)
+{
+    if (!s_flip_each) return cellGcm_take_flip_pending_synced();
+    if (s_flip_hold) {
+        s_flip_pending = 0;
+        s_flip_hold = 0;         /* releases the walker */
+        gcm_flip_each_count(1);
+        return 1;
+    }
+    /* A flip that did not come through the FIFO (immediate SetFlip): the old
+     * rule still decides. */
+    if (cellGcm_take_flip_pending_synced()) { gcm_flip_each_count(1); return 1; }
+    return 0;
+}
+
+/* 1 while the walker must stay parked at a flip. */
+static int gcm_flip_each_holding(void)
+{
+    if (!s_flip_hold) return 0;
+    const unsigned long long now = ps3_ms_now();
+    if (now - s_flip_hold_since_ms < GCM_FLIP_HOLD_MAX_MS) return 1;
+    { static u32 n;
+      if (PS3_LOG_FIRST(n, 8))
+          fprintf(stderr, "[flip-present] flip not presented within %u ms; walker released\n",
+                  GCM_FLIP_HOLD_MAX_MS); }
+    s_flip_hold = 0;
+    gcm_flip_each_count(0);
+    return 0;
+}
+
 /* ---- fence (SET_REFERENCE) observability ---------------------------------
  * cellGcmFinish waits for ctrl->ref with EQUALITY. On hardware every fence
  * value persists in the register for the RSX-time until the next fence
@@ -2332,6 +2445,10 @@ volatile unsigned long g_gcm_drain_tid;
 
 void cellGcm_rsx_process_fifo(void)
 {
+    /* Parked at a flip the host has not presented yet (present-each-flip):
+     * executing on would start the next scene over the picture about to be
+     * shown. */
+    if (s_flip_each && gcm_flip_each_holding()) return;
     wprof_note_walker();
     g_gcm_drain_tid = GetCurrentThreadId();
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
@@ -2749,6 +2866,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
             }
+            /* Everything before the flip has been executed and nothing after
+             * it: the moment the flipped buffer is the finished frame. */
+            gcm_flip_snapshot();
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
              * behind it is a deadlock, because the title's ring can only be
@@ -2763,6 +2883,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * 3 MB ring at boot, wraps, and a walker stopping at every flip
              * then crawled ~1 KB a tick while the title wrote over the
              * commands ahead of it. */
+            /* Present-each-flip: stop here whatever the backlog and wait for
+             * the host to show this frame (cellGcm_take_flip_pending_each).
+             * The catch-up below exists because a walker limited to one flip
+             * per tick starves a title that is ahead; this hold lasts one
+             * present, not one tick. */
+            if (s_flip_each && s_flip_pending) {
+                s_flip_hold_since_ms = ps3_ms_now();
+                s_flip_hold = 1;
+                why = "flip"; break;
+            }
             if (gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)
                 { why = "flip"; break; }
             continue;
