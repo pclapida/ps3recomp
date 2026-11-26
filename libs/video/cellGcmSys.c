@@ -1284,9 +1284,78 @@ static inline u64 nv3089_origin(u32 p) { return (u64)p << 16; }
  * The live renderer has the same gap and takes the same two calls
  * (rsx_live_draw_guest_read / _wrote, LD_NV3089_GUEST); it also wants the
  * other end of the copy, because it keeps local -> local copies on the GPU. */
+/* GCM_BLIT_WAIT_JOBS_MS=<ms> (default 0 = off): before a main-memory -> local
+ * copy, wait up to that long for the title's SPU jobs to finish.
+ *
+ * An experiment for Twisted Metal. Its final image is composed by jobs that
+ * work on main-memory copies of the frame's layers, and the result comes back
+ * with an NV3089 copy from main memory into a local surface. Nothing in the
+ * command stream orders that copy after the jobs: on the console the RSX gets
+ * there late enough. Here the picture is right only while the walker is slow
+ * -- every change that let it reach the copy sooner (present at each flip,
+ * flip snapshots, early GPU submits) showed half-composed frames. The title
+ * already tells the walker whether jobs are queued or running
+ * (g_gcm_park_hold_hook, set for the Edge holes); this waits on that same
+ * answer, bounded, so a job that itself waits on the RSX cannot deadlock. */
+/* The precise form of that wait, when the title provides it: non-zero while a
+ * job that writes the main-memory range [src_ea, src_ea + bytes) is queued or
+ * running. Waiting on every job (the hook above) restored the picture and
+ * gave back the speed: it also waits for the next frame's geometry jobs.
+ * GCM_BLIT_WAIT_MS bounds it (default 50, 0 = off). GCM_BLIT_WAIT_JOBS_MS, when
+ * set, selects the wait on every job instead. */
+int (*g_gcm_blit_wait_hook)(u32 src_ea, u32 bytes) = NULL;
+
+static void nv3089_wait_jobs(u32 src_ea, u32 bytes)
+{
+    static long long all_ms = -1, max_ms = -1;
+    static unsigned long long n_waits, n_timeouts, total_ms;
+    if (max_ms < 0) {
+        const char* ea = getenv("GCM_BLIT_WAIT_JOBS_MS");
+        const char* em = getenv("GCM_BLIT_WAIT_MS");
+        all_ms = ea ? atoll(ea) : 0;
+        if (all_ms < 0) all_ms = 0;
+        max_ms = em ? atoll(em) : 50;
+        if (max_ms < 0) max_ms = 0;
+        fprintf(stderr, "[blit-wait] main -> local NV3089 copies: GCM_BLIT_WAIT_JOBS_MS=%lld "
+                        "(wait for every SPU job), GCM_BLIT_WAIT_MS=%lld (wait for the jobs "
+                        "that write the source, when the title reports them: %s)\n",
+                all_ms, max_ms, g_gcm_blit_wait_hook ? "yes" : "no");
+    }
+    const int precise = !all_ms && g_gcm_blit_wait_hook != NULL;
+    const unsigned long long limit = (unsigned long long)(precise ? max_ms : all_ms);
+    if (!limit) return;
+    if (!precise && !g_gcm_park_hold_hook) return;
+#define NV3089_JOBS_BUSY() (precise ? g_gcm_blit_wait_hook(src_ea, bytes) : g_gcm_park_hold_hook(0, 0))
+    if (!NV3089_JOBS_BUSY()) return;
+    const unsigned long long t0 = ps3_ms_now();
+    unsigned long long now = t0;
+    int busy = 1;
+    while ((busy = NV3089_JOBS_BUSY()) != 0 && (now = ps3_ms_now()) - t0 < limit) {
+#ifdef _WIN32
+        Sleep(0);
+#else
+        sched_yield();
+#endif
+    }
+#undef NV3089_JOBS_BUSY
+    n_waits++;
+    total_ms += now - t0;
+    if (busy) n_timeouts++;
+    if (n_waits == 1ull || (n_waits % 512ull) == 0)
+        fprintf(stderr, "[blit-wait] %llu waits (%s), %llu timed out, %.2f ms each\n",
+                n_waits, precise ? "jobs writing the source" : "every job", n_timeouts,
+                (double)total_ms / (double)n_waits);
+}
+
 static void nv3089_engine_read(u32 in_pitch, u32 out_w, u32 out_h)
 {
     const int live = !rsx_draw_engine_enabled() && rsx_live_draw_enabled();
+    /* Source in main memory, destination local: the bytes about to be copied
+     * are the title's own (see nv3089_wait_jobs). */
+    if (live && s_nv3089.src_dma == 0xFEED0001u && s_gcm2d.dst_dma != 0xFEED0001u) {
+        const u32 rows = (s_nv3089.in_sz >> 16) ? (s_nv3089.in_sz >> 16) : out_h;
+        nv3089_wait_jobs(cellGcmResolveLocated(0, s_nv3089.in_off), in_pitch * rows);
+    }
     if ((!rsx_draw_engine_enabled() && !live) || !out_w || !out_h) return;
     const u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 */
     const u32 sx0 = (u32)(nv3089_origin(u0) >> 20), sy0 = (u32)(nv3089_origin(v0) >> 20);
