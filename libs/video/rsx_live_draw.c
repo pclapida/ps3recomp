@@ -212,6 +212,8 @@ typedef struct {
     u32 w, h;
     DXGI_FORMAT fmt;
     ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
+    u64 fb_serial;            /* last_write_serial the copy was taken at */
+    u8  fb_valid;             /* fb_tex holds a copy (of fb_serial) */
     u32 pitch;                /* guest row pitch of colour target 0 (bytes), 0 = unknown */
     /* Top-left windows of the surface for smaller aliasing textures (see surface_window). */
     struct { ID3D12Resource* tex; ID3D12Resource* src; u32 w, h, wgen, used; } swin[LD_SWIN_PER];
@@ -3098,6 +3100,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         retire_texture(s->fb_tex);
         s->fb_tex = NULL;
     }
+    s->fb_valid = 0;
     for (u32 j = 0; j < LD_SWIN_PER; j++)   /* windows are sized and typed for the old resource */
         if (s->swin[j].tex) { retire_texture(s->swin[j].tex); s->swin[j].tex = NULL; }
     s->tex = replacement;
@@ -3299,10 +3302,47 @@ static int surface_feedback_matches(const surface_t* s, const rsx_dsp_texture* t
  * guest VRAM -- empty, so the pass painted the scene black. Snapshot the
  * target into a per-surface copy and sample that. Returns the SRV slot, or
  * SRV_WHITE if the copy cannot be made. */
+/* LD_FEEDBACK_GEN (default on; 0 = copy on every such bind, sample every
+ * enabled unit, as before).
+ *
+ * Twisted Metal's shadow pass renders ~733 draws per scene into 0:0x22D0000
+ * (1472x1472, no colour written) with a texture unit left over from the
+ * light pass still pointing at that address. Each of those draws copied the
+ * whole 8.7 MB target for a read the program never makes: about 6.4 GB of
+ * copies per scene. Two rules remove them: a feedback copy is reused while
+ * the target has not been written since it was taken, and a unit the
+ * fragment program does not sample is not resolved at all. */
+static int ld_feedback_gen(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("LD_FEEDBACK_GEN");
+        on = e ? atoi(e) != 0 : 1;
+        fprintf(stderr, "[feedback] LD_FEEDBACK_GEN=%d: own-target copies %s, texture units %s\n",
+                on, on ? "only after the target changed" : "on every bind (legacy)",
+                on ? "resolved only when the fragment program samples them"
+                   : "all resolved (legacy)");
+    }
+    return on;
+}
+static u64 g_ld_fb_copies, g_ld_fb_reused, g_ld_units_skipped;
+
 static u32 surface_feedback_srv(u32 slot)
 {
     surface_t* s = &g.surfaces[slot];
     if (!s->tex) return SRV_WHITE;
+    /* Every colour write to the surface bumps last_write_serial
+     * (ld_surface_note_write); unchanged since the copy = the copy is it. */
+    if (s->fb_tex && s->fb_valid && s->fb_serial == s->last_write_serial && ld_feedback_gen()) {
+        g_ld_fb_reused++;
+        return SRV_FEEDBACK_BASE + slot;
+    }
+    g_ld_fb_copies++;
+    if (((g_ld_fb_copies + g_ld_fb_reused) & 0xFFFFFu) == 0 || g_ld_fb_copies == 1u)
+        fprintf(stderr, "[feedback] frame %u: own-target copies made=%llu reused=%llu, "
+                        "unsampled units skipped=%llu\n", g_ld_frames,
+                (unsigned long long)g_ld_fb_copies, (unsigned long long)g_ld_fb_reused,
+                (unsigned long long)g_ld_units_skipped);
     D3D12_RESOURCE_BARRIER b[2] = {0};
     for (int k = 0; k < 2; k++) {
         b[k].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3338,6 +3378,8 @@ static u32 surface_feedback_srv(u32 slot)
     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    s->fb_valid = 1;
+    s->fb_serial = s->last_write_serial;
     return SRV_FEEDBACK_BASE + slot;
 }
 
@@ -7984,6 +8026,15 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     u32 texture_mask = 0;
     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) slots[u] = SRV_WHITE;
     for (u32 u = 0; u < SMP_TABLE_SIZE; u++) smp_slots[u] = SMP_DEFAULT;
+    /* Units the bound fragment program has a fetch for (get_pso, just above,
+     * validated the program and recorded where it is). All of them when the
+     * switch is off or the program cannot be read. */
+    u32 fp_sampled_units = 0xFFFFFFFFu;
+    if (ld_feedback_gen() && g_ld_current_pso.valid && g_ld_current_pso.fp_size) {
+        const u8* fp_now = guest_ptr(g_ld_current_pso.fp_location, g_ld_current_pso.fp_offset,
+                                     g_ld_current_pso.fp_size);
+        if (fp_now) fp_sampled_units = rsx_fp_texture_units(fp_now, g_ld_current_pso.fp_size);
+    }
     /* A draw that samples its own zeta while not writing depth (deferred
      * lighting reading the scene depth it also depth-tests against, soft
      * particles) reads the snapshot: the zeta does not change during such a
@@ -8048,6 +8099,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
               t.offset = 0x400000u; }
         if (!t.enabled) continue;
         texture_mask |= 1u << u;
+        /* Enabled but not sampled by this program (a unit left over from an
+         * earlier pass): leave it on the white default. Resolving it costs a
+         * cache lookup at best and a whole-surface copy at worst
+         * (ld_feedback_gen). */
+        if (!((fp_sampled_units >> u) & 1u)) { g_ld_units_skipped++; continue; }
         smp_slots[u] = sampler_slot(&t, sampler_key(&t));
         /* Pick WHICH surface at this offset to sample.
          *
@@ -8544,6 +8600,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
          * offset. Any real write clears the condition by itself. */
         if (!g.surfaces[target].last_write_serial)
             g.surfaces[target].ct0_ghost = 1;
+    } else if (!rsx_dsp_reg(&g.rsx, M_COLOR_MASK) && ld_feedback_gen()) {
+        /* Colour mask 0 (stencil and depth-only passes): the colour surface
+         * is what it was, so copies taken of it stay good. One mask covers
+         * all targets here (apply_render_state). */
     } else {
         ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
         for (u32 r = 1; r < n_mrt; r++)
