@@ -300,6 +300,11 @@ typedef struct {
     ID3D12CommandQueue*        queue;
     ID3D12CommandAllocator*    alloc;
     ID3D12GraphicsCommandList* list;
+    /* The interfaces of dev/list that carry the depth bounds test
+     * (ld_depth_bounds_init). Both NULL when LD_DEPTH_BOUNDS=0 or the adapter
+     * has no such test; every user checks list1. */
+    ID3D12Device2*              dev2;
+    ID3D12GraphicsCommandList1* list1;
     ID3D12Fence*               fence;
     HANDLE                     fence_event;
     u64                        fence_value;
@@ -1289,6 +1294,9 @@ int rsx_live_draw_enabled(void)
 #define M_DEPTH_FUNC         0x0A6C
 #define M_DEPTH_WRITE        0x0A70
 #define M_DEPTH_TEST_ENABLE  0x0A74
+#define M_DEPTH_BOUNDS_TEST_ENABLE 0x0380
+#define M_DEPTH_BOUNDS_MIN   0x0384   /* float */
+#define M_DEPTH_BOUNDS_MAX   0x0388   /* float */
 #define M_CULL_FACE          0x1830
 #define M_FRONT_FACE         0x1834
 #define M_CULL_FACE_ENABLE   0x183C
@@ -1389,7 +1397,15 @@ typedef struct {
     u32 stencil_enable, stencil_two_sided;
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
+    /* Depth bounds test enable (SET_DEPTH_BOUNDS_TEST_ENABLE), already gated
+     * on LD_DEPTH_BOUNDS and adapter support. PSO state; the bounds are
+     * dynamic (OMSetDepthBounds) and not here. Keep this the LAST field: the
+     * byte-wise PSO keys stop before it when it is 0 (LD_RS_KEY_BYTES), so
+     * draws without the test keep the keys they had before it existed. */
+    u32 depth_bounds;
 } render_state_t;
+#define LD_RS_KEY_BYTES(rs) \
+    ((rs)->depth_bounds ? sizeof(render_state_t) : offsetof(render_state_t, depth_bounds))
 
 static void decode_render_state(render_state_t* rs)
 {
@@ -1424,6 +1440,9 @@ static void decode_render_state(render_state_t* rs)
      * shadow-mask depth-prime pass). rsx_dispatch_init seeds the nv40
      * reset default (0x01010101), so never-written reads as all-on. */
     rs->color_mask  = rsx_dsp_reg(&g.rsx, M_COLOR_MASK);
+    /* Needs a bound depth buffer: the test reads the stored depth. */
+    rs->depth_bounds = g.list1 && g.depth &&
+        (rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_TEST_ENABLE) & 1);
     rs->stencil_enable    = rsx_dsp_reg(&g.rsx, M_STENCIL_TEST_ENABLE) & 1;
     rs->stencil_two_sided = rsx_dsp_reg(&g.rsx, M_TWO_SIDED_STENCIL) & 1;
     rs->s_func       = rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC);
@@ -4366,6 +4385,124 @@ static void shader_disk_cache_store(
     shader_disk_cache_progress(value);
 }
 
+/* A graphics PSO with the depth bounds test enabled.
+ *
+ * D3D12_GRAPHICS_PIPELINE_STATE_DESC has no field for the test: it lives in
+ * D3D12_DEPTH_STENCIL_DESC1, which only the pipeline state stream of
+ * ID3D12Device2::CreatePipelineState accepts. The stream is a packed sequence
+ * of { subobject type, payload } records, each aligned to a pointer; the
+ * union with a pointer gives a record that alignment and padding in C. Only
+ * PSOs that need the test come through here, built from the same desc the
+ * plain path uses, so every other PSO is created exactly as before. */
+#define LD_PSS(T, name) \
+    union { struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; T v; } s; void* align; } name
+typedef struct {
+    LD_PSS(ID3D12RootSignature*,          root);
+    LD_PSS(D3D12_SHADER_BYTECODE,         vs);
+    LD_PSS(D3D12_SHADER_BYTECODE,         ps);
+    LD_PSS(D3D12_BLEND_DESC,              blend);
+    LD_PSS(UINT,                          sample_mask);
+    LD_PSS(D3D12_RASTERIZER_DESC,         raster);
+    LD_PSS(D3D12_DEPTH_STENCIL_DESC1,     depth);
+    LD_PSS(D3D12_INPUT_LAYOUT_DESC,       layout);
+    LD_PSS(D3D12_PRIMITIVE_TOPOLOGY_TYPE, topology);
+    LD_PSS(struct D3D12_RT_FORMAT_ARRAY,  rt_formats);   /* no typedef in the C header */
+    LD_PSS(DXGI_FORMAT,                   dsv_format);
+    LD_PSS(DXGI_SAMPLE_DESC,              sample_desc);
+} ld_pso_stream;
+#undef LD_PSS
+
+static HRESULT ld_create_pso_depth_bounds(
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, ID3D12PipelineState** out)
+{
+    static ld_pso_stream st;         /* render thread only; zeroed for the padding */
+    memset(&st, 0, sizeof(st));
+    st.root.s.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+    st.root.s.v = pd->pRootSignature;
+    st.vs.s.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
+    st.vs.s.v = pd->VS;
+    st.ps.s.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;
+    st.ps.s.v = pd->PS;
+    st.blend.s.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND;
+    st.blend.s.v = pd->BlendState;
+    st.sample_mask.s.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK;
+    st.sample_mask.s.v = pd->SampleMask;
+    st.raster.s.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
+    st.raster.s.v = pd->RasterizerState;
+    st.depth.s.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1;
+    st.depth.s.v.DepthEnable      = pd->DepthStencilState.DepthEnable;
+    st.depth.s.v.DepthWriteMask   = pd->DepthStencilState.DepthWriteMask;
+    st.depth.s.v.DepthFunc        = pd->DepthStencilState.DepthFunc;
+    st.depth.s.v.StencilEnable    = pd->DepthStencilState.StencilEnable;
+    st.depth.s.v.StencilReadMask  = pd->DepthStencilState.StencilReadMask;
+    st.depth.s.v.StencilWriteMask = pd->DepthStencilState.StencilWriteMask;
+    st.depth.s.v.FrontFace        = pd->DepthStencilState.FrontFace;
+    st.depth.s.v.BackFace         = pd->DepthStencilState.BackFace;
+    st.depth.s.v.DepthBoundsTestEnable = TRUE;
+    st.layout.s.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT;
+    st.layout.s.v = pd->InputLayout;
+    st.topology.s.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY;
+    st.topology.s.v = pd->PrimitiveTopologyType;
+    st.rt_formats.s.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+    st.rt_formats.s.v.NumRenderTargets = pd->NumRenderTargets;
+    for (u32 r = 0; r < 8; r++)
+        st.rt_formats.s.v.RTFormats[r] = pd->RTVFormats[r];
+    st.dsv_format.s.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT;
+    st.dsv_format.s.v = pd->DSVFormat;
+    st.sample_desc.s.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC;
+    st.sample_desc.s.v = pd->SampleDesc;
+    D3D12_PIPELINE_STATE_STREAM_DESC sd;
+    sd.SizeInBytes = sizeof(st);
+    sd.pPipelineStateSubobjectStream = &st;
+    return g.dev2->lpVtbl->CreatePipelineState(
+        g.dev2, &sd, &IID_ID3D12PipelineState, (void**)out);
+}
+
+/* LD_DEPTH_BOUNDS (default on): NV4097 depth bounds test.
+ *
+ * Twisted Metal's deferred resolve draws full-screen passes with the depth
+ * test off and tells geometry from sky with SET_DEPTH_BOUNDS_TEST_ENABLE and
+ * MIN/MAX: the sun pass and the combine pass are bounded to the geometry, the
+ * sky pass and a constant fill to the far plane. Without the test each pair
+ * overwrote the other across the whole screen -- the sky over the buildings,
+ * the constant over the accumulated light.
+ *
+ * Called once, after the device and the command list exist. */
+static void ld_depth_bounds_init(void)
+{
+    /* The IIDs are spelled out here so the runtime library does not grow a
+     * dependency on a dxguid.lib new enough to carry them. */
+    static const GUID iid_device2 =
+        { 0x30baa41e, 0xb15b, 0x475c, { 0xa0, 0xbb, 0x1a, 0xf5, 0xc5, 0xb6, 0x43, 0x28 } };
+    static const GUID iid_list1 =
+        { 0x553103fb, 0x1fe7, 0x4557, { 0xbb, 0x38, 0x94, 0x6d, 0x7d, 0x0e, 0x7c, 0xa7 } };
+    const char* e = getenv("LD_DEPTH_BOUNDS");
+    const int want = e ? atoi(e) != 0 : 1;
+    int supported = 0;
+    g.dev2 = NULL; g.list1 = NULL;
+    if (want && g.dev && g.list) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2;
+        memset(&o2, 0, sizeof(o2));
+        if (SUCCEEDED(g.dev->lpVtbl->CheckFeatureSupport(
+                g.dev, D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof(o2))))
+            supported = o2.DepthBoundsTestSupported ? 1 : 0;
+        if (supported) {
+            g.dev->lpVtbl->QueryInterface(g.dev, &iid_device2, (void**)&g.dev2);
+            g.list->lpVtbl->QueryInterface(g.list, &iid_list1, (void**)&g.list1);
+        }
+        if (!g.dev2 || !g.list1) {      /* all or nothing */
+            if (g.dev2) g.dev2->lpVtbl->Release(g.dev2);
+            if (g.list1) g.list1->lpVtbl->Release(g.list1);
+            g.dev2 = NULL; g.list1 = NULL;
+        }
+    }
+    fprintf(stderr, "[depth-bounds] LD_DEPTH_BOUNDS=%d adapter support=%d -> depth "
+                    "bounds test %s\n",
+            want, supported,
+            g.list1 ? "ON" : want ? "OFF (not supported, draws ignore the bounds)"
+                                  : "OFF (disabled)");
+}
+
 static u64 ld_hash_structural_render_state(
     const render_state_t* state, u64 hash)
 {
@@ -4404,6 +4541,9 @@ static u64 ld_hash_structural_render_state(
     LD_HASH_RENDER_FIELD(bs_fail);
     LD_HASH_RENDER_FIELD(bs_zfail);
     LD_HASH_RENDER_FIELD(bs_zpass);
+    /* Only when set, so every key without the test is what it was before. */
+    if (state->depth_bounds)
+        LD_HASH_RENDER_FIELD(depth_bounds);
 #undef LD_HASH_RENDER_FIELD
     return hash;
 }
@@ -4822,8 +4962,21 @@ static ID3D12PipelineState* build_pso(
     g_ld_profile.total.create_pso_calls++;
     const LONGLONG create_begin = ld_profile_qpc();
 #endif
-    HRESULT hr = g.dev->lpVtbl->CreateGraphicsPipelineState(
-        g.dev, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    HRESULT hr = E_FAIL;
+    if (rs->depth_bounds && g.dev2) {
+        hr = ld_create_pso_depth_bounds(&pd, &pso);
+        static u32 stream_logs = 0;
+        if (PS3_LOG_FIRST(stream_logs, 4))
+            fprintf(stderr, "[depth-bounds] PSO with depth bounds test: hr=0x%08lX%s\n",
+                    (unsigned long)hr,
+                    FAILED(hr) ? " (falling back to a PSO without the test)" : "");
+        if (FAILED(hr)) pso = NULL;
+    }
+    /* Also the fallback when the stream is refused: the draw then runs
+     * unbounded, as every such draw did before the test existed. */
+    if (FAILED(hr))
+        hr = g.dev->lpVtbl->CreateGraphicsPipelineState(
+            g.dev, &pd, &IID_ID3D12PipelineState, (void**)&pso);
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.create_pso_qpc +=
         (u64)(ld_profile_qpc() - create_begin);
@@ -5068,7 +5221,7 @@ static ID3D12PipelineState* get_pso(
     if (ld_fp_constants_buffered())
         key = ld_hash_structural_render_state(&rs, key);
     else
-        key = fnv1a(&rs, sizeof(rs), key);
+        key = fnv1a(&rs, LD_RS_KEY_BYTES(&rs), key);
 #if defined(YZ_PERF_PROFILE)
     ld_profile_note_fp_variants(
         fp_uc, fp_size, fp_ctrl_key, cube_mask, &rs);
@@ -6666,7 +6819,8 @@ static u64 live_legacy_pso_key(void)
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     render_state_t rs;
     decode_render_state(&rs);
-    return fnv1a(&rs, sizeof(rs), key);
+    key = fnv1a(&rs, LD_RS_KEY_BYTES(&rs), key);
+    return key;
 }
 
 /* Hash the canonical sixteen-attribute vertex stream in source occurrence
@@ -6845,6 +6999,10 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
         fprintf(file, "bf=%X/%X/%X/%X eq=%X/%X ", rs.sf_rgb, rs.df_rgb, rs.sf_a, rs.df_a,
                 rs.eq_rgb, rs.eq_a);
     fprintf(file, "at=%u/0x%X/0x%X ", rs.alpha_test_enable, rs.alpha_func, rs.alpha_ref_raw);
+    /* Depth bounds as the game wrote them (enable/min/max, raw float bits),
+     * whether or not the host applies the test (LD_DEPTH_BOUNDS). */
+    fprintf(file, "db=%u/%08X/%08X ", rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_TEST_ENABLE) & 1,
+            rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MIN), rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MAX));
     fprintf(file, "sc=%08X/%08X ", rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL), rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL));
     if (rs.stencil_enable)
         fprintf(file, "st=%X/%X/%X/%X/%X/%X ref=%X ", rs.s_func, rs.s_func_mask, rs.s_write_mask, rs.s_fail, rs.s_zfail, rs.s_zpass, rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC + 4));
@@ -8126,6 +8284,31 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     /* Dynamic stencil reference (kept out of the PSO key on purpose). */
     g.list->lpVtbl->OMSetStencilRef(
         g.list, rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
+    /* Dynamic depth bounds, for a PSO built with the test (the same condition
+     * as render_state_t.depth_bounds). The DSV of the current zeta is bound
+     * above whether or not the depth test is on -- these draws run with it
+     * off -- and the test reads that buffer. Saturated into the depth range
+     * as the hardware does; NaN reads as 0. A PSO without the test ignores
+     * the values, so nothing resets them. */
+    if (g.list1 && have_dsv &&
+        (rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_TEST_ENABLE) & 1)) {
+        const u32 lo = rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MIN);
+        const u32 hi = rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MAX);
+        float mn, mx;
+        memcpy(&mn, &lo, sizeof(mn));
+        memcpy(&mx, &hi, sizeof(mx));
+        mn = mn > 0.0f ? (mn < 1.0f ? mn : 1.0f) : 0.0f;
+        mx = mx > 0.0f ? (mx < 1.0f ? mx : 1.0f) : 0.0f;
+        if (mx < mn) mx = mn;        /* D3D12 requires min <= max */
+        g.list1->lpVtbl->OMSetDepthBounds(g.list1, mn, mx);
+        { static u32 n;
+          if (PS3_LOG_FIRST(n, 6))
+              fprintf(stderr, "[depth-bounds] frame %u draw to %u:0x%X zeta slot %u: "
+                              "bounds %.6f..%.6f (raw %08X/%08X) dtest=%u\n",
+                      g_ld_frames, g.surfaces[target].location, g.surfaces[target].offset,
+                      current_zslot, mn, mx, lo, hi,
+                      rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1); }
+    }
 
     D3D12_VERTEX_BUFFER_VIEW vbv;
     vbv.BufferLocation = g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
@@ -8684,6 +8867,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
                                      &IID_ID3D12GraphicsCommandList, (void**)&g.list);
     if (g.queue) g.queue->lpVtbl->SetName(g.queue, L"rsx-live-queue");
     if (g.list) g.list->lpVtbl->SetName(g.list, L"rsx-live-list");
+    ld_depth_bounds_init();
     g.dev->lpVtbl->CreateFence(g.dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&g.fence);
     g.fence_event = CreateEventA(NULL, FALSE, FALSE, NULL);
 
@@ -10878,6 +11062,8 @@ void rsx_live_draw_shutdown(void)
         g_ld_profile.adapter = NULL;
     }
 #endif
+    if (g.list1) g.list1->lpVtbl->Release(g.list1);
+    if (g.dev2) g.dev2->lpVtbl->Release(g.dev2);
     if (g.dev) g.dev->lpVtbl->Release(g.dev);
     memset(&g, 0, sizeof(g));
     if (dc.verts) { free(dc.verts); dc.verts = NULL; dc.cap_verts = 0; }
