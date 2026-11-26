@@ -113,6 +113,9 @@ void rsx_live_draw_flush(void);
 
 /* Present the given display buffer id (called from the flip path). */
 void rsx_live_draw_present(u32 buffer_id);
+/* Present interval chosen by the host (1 = vsync, 0 = immediate), used unless
+ * LD_PRESENT_INTERVAL is set. Call before the first present. */
+void rsx_live_draw_set_present_interval(int interval);
 
 /* Movie playback: while on, the guest method stream is ignored so a host-decoded
  * movie can own the window without the guest's draws racing g.list. */

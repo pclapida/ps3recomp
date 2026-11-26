@@ -45,6 +45,7 @@ int  rsx_live_draw_blit(u32 sl, u32 sa, u32 sp, u32 dl, u32 da, u32 dp, u32 w, u
 { (void)sl; (void)sa; (void)sp; (void)dl; (void)da; (void)dp; (void)w; (void)h; return 0; }
 void rsx_live_draw_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h, u32 d)
 { (void)l; (void)o; (void)p; (void)w; (void)h; (void)d; }
+void rsx_live_draw_set_present_interval(int interval) { (void)interval; }
 void rsx_live_draw_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h, u32 sl)
 { (void)l; (void)o; (void)p; (void)w; (void)h; (void)sl; }
 int  rsx_live_draw_resolve_blit(u32 sl, u32 sa, u32 sp, u32 ds, u32 dt, u32 dl, u32 da,
@@ -3462,6 +3463,36 @@ static int   s_csv_gate_open;
  * that is a live surface is uploaded from guest memory
  * (rsx_live_draw_guest_wrote). Each read-back flushes and waits for the GPU:
  * correctness first, batching per frame is a later step. */
+/* LD_PRESENT_INTERVAL (default 1 = vsync, as before; 0 = present at once).
+ *
+ * A measurement switch. With the round trip on, menus fell from 60 to 30 fps
+ * and each mid-frame GPU wait averages ~17.5 ms whatever the scene costs: one
+ * refresh period. That is what a wait looks like when it queues behind the
+ * previous frame's vsynced flip in the same command queue. 0 takes the flip
+ * off the vblank; if the wait collapses, the cost was the flip, not the GPU. */
+static int s_present_interval_host = -1;   /* rsx_live_draw_set_present_interval; -1 = none */
+static UINT ld_present_interval(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("LD_PRESENT_INTERVAL");
+        v = e ? (atoi(e) != 0) : s_present_interval_host >= 0 ? s_present_interval_host : 1;
+        fprintf(stderr, "[present] present interval %d (%s; %s)\n", v,
+                v ? "vsync" : "immediate",
+                e ? "LD_PRESENT_INTERVAL" : s_present_interval_host >= 0 ? "set by the host" : "default");
+    }
+    return (UINT)v;
+}
+/* The host's choice of present interval, used unless LD_PRESENT_INTERVAL is
+ * set. cellGcmSys asks for 0 in present-each-flip mode: there the FIFO walker
+ * is parked while the frame is presented, and a vsynced Present parks it for
+ * a whole refresh with commands still queued behind the flip. Call before
+ * the first present. */
+void rsx_live_draw_set_present_interval(int interval)
+{
+    s_present_interval_host = interval ? 1 : 0;
+}
+
 static int ld_nv3089_guest(void)
 {
     static int on = -1;
@@ -10466,7 +10497,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
 
     ld_flush(LD_FLUSH_MOVIE_PRESENT);
     {
-        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
+        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, ld_present_interval(), 0);
         if (SUCCEEDED(present_hr))
             ld_present_measure_record(g_ld_frames);
         else {
@@ -11024,7 +11055,7 @@ void rsx_live_draw_present(u32 buffer_id)
 
     ld_flush(LD_FLUSH_PRESENT);
     {
-        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
+        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, ld_present_interval(), 0);
         if (SUCCEEDED(present_hr))
             ld_present_measure_record(g_ld_frames + 1u);
         else {
