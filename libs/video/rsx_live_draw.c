@@ -466,6 +466,7 @@ typedef struct {
     u32 vp_start, vp_instrs;
     u32 fp_location, fp_offset, fp_size, fp_control;
     u32 cube_mask, vtex_mask, txl_mask;
+    u32 x32_mask;             /* units read as X32_FLOAT over an RGBA8 surface (ld_x32_units) */
     u32 input_mask, input_stride;
     u32 packed_offsets;
 } ld_pso_metadata;
@@ -2065,6 +2066,35 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
         }
         break;
     }
+    case RSX_TEX_FMT_Y16X16_FLOAT: {
+        /* Two big-endian halves. Twisted Metal's sky tint is a 1024x1 LUT in
+         * this format; undecoded it was bound as white. The halves are read
+         * as RPCS3 presents them (first -> A and G, second -> R and B, its
+         * { RED, GREEN, RED, GREEN } ARGB vector); the texture's own remap
+         * then picks from those. Clamped to 8 bits like the four-half
+         * format above: the cache is RGBA8 throughout. */
+        u8 v[2];
+        for (int c = 0; c < 2; c++) {
+            const u16 hbits = (u16)((p[c * 2] << 8) | p[c * 2 + 1]);
+            const int  exp  = (hbits >> 10) & 0x1F;
+            const int  man  = hbits & 0x3FF;
+            float f;
+            if (exp == 0)        f = (float)man * (1.0f / 16384.0f) * (1.0f / 64.0f);
+            else if (exp == 31)  f = 1.0f;
+            else {
+                float m = 1.0f + (float)man / 1024.0f;
+                int   e = exp - 15;
+                while (e > 0) { m *= 2.0f; e--; }
+                while (e < 0) { m *= 0.5f; e++; }
+                f = m;
+            }
+            if (hbits & 0x8000) f = 0.0f;
+            if (f > 1.0f) f = 1.0f;
+            v[c] = (u8)(f * 255.0f + 0.5f);
+        }
+        s[0] = v[0]; s[1] = v[1]; s[2] = v[0]; s[3] = v[1];
+        break;
+    }
     case TEX_FMT_DEPTH24_D8: s[0] = 255; s[1] = s[2] = s[3] = p[0]; break;
     default: s[0] = p[0]; s[1] = p[1]; s[2] = p[2]; s[3] = p[3]; break;
     }
@@ -2206,6 +2236,7 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
     case TEX_FMT_R5G6B5:
     case TEX_FMT_G8B8: texel_size = 2; break;
     case RSX_TEX_FMT_W16Z16Y16X16_FLOAT: texel_size = 8; break;
+    case RSX_TEX_FMT_Y16X16_FLOAT:
     case TEX_FMT_A8R8G8B8:
     case TEX_FMT_DEPTH24_D8: texel_size = 4; break;
     default: return 0;
@@ -2389,6 +2420,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
     case TEX_FMT_R5G6B5:
     case TEX_FMT_G8B8: texel_size = 2; break;
     case TEX_FMT_A8R8G8B8:
+    case RSX_TEX_FMT_Y16X16_FLOAT:
     case TEX_FMT_DEPTH24_D8: texel_size = 4; break;
     case RSX_TEX_FMT_W16Z16Y16X16_FLOAT: texel_size = 8; break;
     default: return NULL;
@@ -4689,6 +4721,109 @@ static void ld_depth_bounds_init(void)
                                   : "OFF (disabled)");
 }
 
+/* LD_X32_SURFACE (default on): an X32_FLOAT texture over an RGBA8 surface.
+ *
+ * Twisted Metal writes linear depth as a float packed into the four bytes of
+ * an RGBA8 target (0:0xAB1400, 640x352) and the next pass reads that memory
+ * as X32_FLOAT (0xFC) to build its half-resolution blur input. On the RSX
+ * that is the same four bytes; here the bind found the RGBA8 surface and the
+ * program received four UNORM channels where it expected one float, so the
+ * half-resolution buffer, the bloom targets, and whatever the final
+ * composite takes from them stayed black. The reinterpretation is done in
+ * the fragment program: the unit is point sampled and the fetch is wrapped
+ * in a helper that puts the bytes back together (guest order A,R,G,B = the
+ * float's bytes, most significant first). No extra resource, no extra copy.
+ *
+ * Returns the surface such a unit reads, or -1. Used when the PSO is built
+ * (the wrapping is baked into the HLSL and keyed) and again at bind time,
+ * with the same answer. */
+static int ld_x32_surface(const rsx_dsp_texture* t)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("LD_X32_SURFACE");
+        on = e ? atoi(e) != 0 : 1;
+        fprintf(stderr, "[x32] LD_X32_SURFACE=%d: X32_FLOAT textures over RGBA8 surfaces %s\n",
+                on, on ? "reinterpreted as a float in the fragment program"
+                       : "sampled as UNORM (legacy)");
+    }
+    if (!on || !t->enabled || (t->format & TEX_FMT_BASE_MASK) != RSX_TEX_FMT_X32_FLOAT ||
+        t->dimension != 2 || t->cubemap)
+        return -1;
+    int best = -1;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const surface_t* s = &g.surfaces[i];
+        if (!s->tex || s->location != t->location || s->offset != t->offset ||
+            s->fmt != DXGI_FORMAT_R8G8B8A8_UNORM || s->w != t->width || s->h != t->height)
+            continue;
+        if (best < 0 || s->last_write_serial > g.surfaces[best].last_write_serial) best = (int)i;
+    }
+    return best;
+}
+static u32 ld_x32_units(void)
+{
+    u32 mask = 0;
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (ld_x32_surface(&t) >= 0) mask |= 1u << u;
+    }
+    return mask;
+}
+/* Wrap every 2D fetch of the units in `mask` in _ld_x32(). Returns the number
+ * of fetches wrapped, -1 when the buffer is too small. Same call-site walk as
+ * rsx_fp_apply_unnorm_scale, which has already run: its scale sits inside the
+ * call and stays there. */
+static int ld_x32_apply(char* hlsl, u32 hlsl_size, u32 mask)
+{
+    static const char helper[] =
+        "float4 _ld_x32(float4 v) {\n"
+        "    uint4 b = (uint4)(saturate(v) * 255.0 + 0.5);\n"
+        "    return (float4)asfloat((b.a << 24) | (b.r << 16) | (b.g << 8) | b.b);\n"
+        "}\n";
+    static const char open_text[] = "_ld_x32(";
+    int patched = 0;
+    for (u32 u = 0; u < 16; u++) {
+        if (!((mask >> u) & 1u)) continue;
+        char needles[2][40];
+        snprintf(needles[0], sizeof needles[0], "rsx_tex[%u].Sample(rsx_samp[%u],", u, u);
+        snprintf(needles[1], sizeof needles[1], "rsx_tex%u.Sample(rsx_samp[%u],", u, u);
+        for (int nidx = 0; nidx < 2; nidx++) {
+            for (;;) {
+                char* at = strstr(hlsl, needles[nidx]);
+                if (!at) break;
+                char* open = strchr(at, '(');
+                int depth = 0;
+                char* q = open;
+                for (; *q; q++) {
+                    if (*q == '(') depth++;
+                    else if (*q == ')') { depth--; if (!depth) break; }
+                }
+                if (*q != ')') return -1;
+                const u32 used = (u32)strlen(hlsl);
+                const u32 olen = (u32)sizeof(open_text) - 1u;
+                if (used + olen + 2u > hlsl_size) return -1;
+                /* close first (higher address), then open */
+                memmove(q + 2, q + 1, used - (u32)(q + 1 - hlsl) + 1u);
+                q[1] = ')';
+                memmove(at + olen, at, used + 1u - (u32)(at - hlsl) + 1u);
+                memcpy(at, open_text, olen);
+                /* mark the site done so the scan moves on */
+                memcpy(at + olen, "rsx_TEX", 7);
+                patched++;
+            }
+        }
+        for (char* q = hlsl; (q = strstr(q, "rsx_TEX")) != NULL; )
+            memcpy(q, "rsx_tex", 7);
+    }
+    if (patched) {
+        const u32 used = (u32)strlen(hlsl), hlen = (u32)sizeof(helper) - 1u;
+        if (used + hlen + 1u > hlsl_size) return -1;
+        memmove(hlsl + hlen, hlsl, used + 1u);
+        memcpy(hlsl, helper, hlen);
+    }
+    return patched;
+}
+
 static u64 ld_hash_structural_render_state(
     const render_state_t* state, u64 hash)
 {
@@ -5398,6 +5533,14 @@ static ID3D12PipelineState* get_pso(
     rsx_fp_shadow_desc shadow[16];
     const u32 shadow_mask = ld_shadow_descs(fp_uc, fp_size, shadow);
     if (shadow_mask) key = fnv1a(shadow, sizeof(shadow), key);
+    /* Units whose fetch is wrapped to rebuild a float from RGBA8 bytes
+     * (ld_x32_surface): baked into the HLSL, so identity. Only when set. */
+    const u32 x32_mask = ld_x32_units();
+    if (x32_mask) {
+        static const u32 x32_tag = 0x32335858u;   /* "XX32" */
+        key = fnv1a(&x32_tag, sizeof(x32_tag), key);
+        key = fnv1a(&x32_mask, sizeof(x32_mask), key);
+    }
     if (masked_layout) {
         static const u32 masked_layout_tag = 0x314B534Du; /* "MSK1" */
         const u32 payload_stride =
@@ -5430,6 +5573,7 @@ static ID3D12PipelineState* get_pso(
     g_ld_current_pso.fp_size = fp_size;
     g_ld_current_pso.fp_control = fp_ctrl;
     g_ld_current_pso.cube_mask = cube_mask;
+    g_ld_current_pso.x32_mask = x32_mask;
     g_ld_current_pso.vtex_mask = vtex_mask;
     g_ld_current_pso.txl_mask = txl_mask;
     g_ld_current_pso.input_mask =
@@ -5533,6 +5677,14 @@ static ID3D12PipelineState* get_pso(
                 ps_hlsl, sizeof(ps_hlsl), unnorm_mask,
                 unnorm_dim, cube_mask, 0u) < 0)
             fi = -1;
+    }
+    if (fi > 0 && x32_mask) {
+        const int nx = ld_x32_apply(ps_hlsl, sizeof(ps_hlsl), x32_mask);
+        { static u32 n;
+          if (PS3_LOG_FIRST(n, 4))
+              fprintf(stderr, "[x32] units 0x%X read as X32_FLOAT over an RGBA8 surface: "
+                              "%d fetches wrapped\n", x32_mask, nx); }
+        if (nx < 0) fi = -1;
     }
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.decompile_qpc +=
@@ -8104,6 +8256,24 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
          * cache lookup at best and a whole-surface copy at worst
          * (ld_feedback_gen). */
         if (!((fp_sampled_units >> u) & 1u)) { g_ld_units_skipped++; continue; }
+        /* X32_FLOAT over an RGBA8 surface (ld_x32_surface): bind that
+         * surface, point sampled -- the program rebuilds the float from the
+         * four bytes, and a filtered byte is not a byte. */
+        if ((g_ld_current_pso.x32_mask >> u) & 1u) {
+            const int xs = ld_x32_surface(&t);
+            if (xs >= 0) {
+                rsx_dsp_texture pt = t;
+                pt.filter = (pt.filter & ~((7u << 16) | (7u << 24))) | (1u << 16) | (1u << 24);
+                smp_slots[u] = sampler_slot(&pt, sampler_key(&pt));
+                g_ld_bind_surf++;
+                if ((u32)xs == target) { slots[u] = surface_feedback_srv(target); continue; }
+                slots[u] = SRV_SURFACE_BASE + (u32)xs;
+                int seen = 0;
+                for (u32 k = 0; k < n_surf_used; k++) if (surf_used[k] == (u32)xs) seen = 1;
+                if (!seen && n_surf_used < SRV_TABLE_SIZE) surf_used[n_surf_used++] = (u32)xs;
+                continue;
+            }
+        }
         smp_slots[u] = sampler_slot(&t, sampler_key(&t));
         /* Pick WHICH surface at this offset to sample.
          *
