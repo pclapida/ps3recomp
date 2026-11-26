@@ -163,7 +163,11 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 /* Top-left windows of a surface for smaller textures that alias it (see surface_window). */
 #define LD_SWIN_PER       2
 #define SRV_SURF_WIN_BASE (SRV_FEEDBACK_BASE + MAX_SURFACES)
-#define SRV_CPU_HEAP_SLOTS (SRV_SURF_WIN_BASE + MAX_SURFACES * LD_SWIN_PER)
+/* Per-zeta RGBA8 copy of the depth packed as the RSX sees a Z24S8 word read
+ * through an A8R8G8B8 texture (see zdepth_pack_create). */
+#define UAV_ZPACK_BASE    (SRV_SURF_WIN_BASE + MAX_SURFACES * LD_SWIN_PER)
+#define SRV_ZPACK_BASE    (UAV_ZPACK_BASE + MAX_SURFACES)
+#define SRV_CPU_HEAP_SLOTS (SRV_ZPACK_BASE + MAX_SURFACES)
 #define SRV_TABLE_SIZE   16
 #define SRV_RING_TABLES  4096
 
@@ -240,6 +244,8 @@ typedef struct {
     u32 w, h;
     u32 snapshot_w, snapshot_h;
     D3D12_RESOURCE_STATES snapshot_state;
+    ID3D12Resource* pack;                 /* RGBA8: bytes of the Z24S8 word, A,R,G,B order */
+    D3D12_RESOURCE_STATES pack_state;
     int cleared;
     int had_write;
     int snapshot_valid;
@@ -1620,6 +1626,36 @@ static void uav_write_zdepth(u32 slot, ID3D12Resource* tex)
     g.dev->lpVtbl->CreateUnorderedAccessView(
         g.dev, tex, NULL, &ud, srv_cpu(slot));
 }
+static void uav_write_zpack(u32 slot, ID3D12Resource* tex)
+{
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {0};
+    ud.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g.dev->lpVtbl->CreateUnorderedAccessView(
+        g.dev, tex, NULL, &ud, srv_cpu(slot));
+}
+/* SRV over the packed depth with the texture's remap: the pack holds the
+ * guest bytes s[0..3] = A,R,G,B in channels 0..3, exactly what decode_texel
+ * reads before remap_comp, so remap_comp's choice becomes a component mapping. */
+static void srv_write_zpack(u32 slot, ID3D12Resource* tex, u32 remap)
+{
+    static const u32 out2comp[4] = { 1, 2, 3, 0 };
+    u32 mapping[4];
+    for (u32 out = 0; out < 4; out++) {
+        const u32 comp = out2comp[out];
+        const u32 op = (remap >> (8 + comp * 2)) & 3;
+        const u32 sel = (remap >> (comp * 2)) & 3;
+        mapping[out] = op == 0 ? 4 : op == 1 ? 5 : sel;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = mapping[0] | (mapping[1] << 3) |
+                                 (mapping[2] << 6) | (mapping[3] << 9) | (1u << 12);
+    sd.Texture2D.MipLevels = 1;
+    g.dev->lpVtbl->CreateShaderResourceView(g.dev, tex, &sd, srv_cpu(slot));
+}
+static void zdepth_pack_create(u32 i, u32 w, u32 h);
 static D3D12_GPU_DESCRIPTOR_HANDLE srv_table(const u32 slots[SRV_TABLE_SIZE])
 {
     if (g.srv_ring_used >= SRV_RING_TABLES) {
@@ -1659,6 +1695,10 @@ static int depth_snapshot_descriptors(
     cpu.ptr += g.srv_step;
     g.dev->lpVtbl->CopyDescriptorsSimple(
         g.dev, 1, cpu, srv_cpu(UAV_ZDEPTH_BASE + zindex),
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    cpu.ptr += g.srv_step;
+    g.dev->lpVtbl->CopyDescriptorsSimple(
+        g.dev, 1, cpu, srv_cpu(UAV_ZPACK_BASE + zindex),
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     D3D12_GPU_DESCRIPTOR_HANDLE gpu;
@@ -3810,6 +3850,31 @@ static D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle(u32 slot)
  * every later full-size read of that depth saw 0 outside the top-left
  * corner. Grow the snapshot to the largest clip bound since, within the
  * depth resource. */
+static void zdepth_pack_create(u32 i, u32 w, u32 h)
+{
+    zdepth_t* z = &g.zdepths[i];
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h;
+    rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource* pack = NULL;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(
+            g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL,
+            &IID_ID3D12Resource, (void**)&pack))) {
+        fprintf(stderr, "[zetatrack] pack create failed #%u %ux%u\n", i, w, h);
+        return;
+    }
+    if (z->pack) retire_texture(z->pack);
+    z->pack = pack;
+    z->pack_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    uav_write_zpack(UAV_ZPACK_BASE + i, pack);
+}
 static void zdepth_grow_snapshot(u32 i, u32 rt_w, u32 rt_h)
 {
     zdepth_t* z = &g.zdepths[i];
@@ -3848,6 +3913,7 @@ static void zdepth_grow_snapshot(u32 i, u32 rt_w, u32 rt_h)
     z->snapshot_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     srv_write_zdepth(SRV_ZDEPTH_BASE + i, z->snapshot);
     uav_write_zdepth(UAV_ZDEPTH_BASE + i, z->snapshot);
+    zdepth_pack_create(i, nw, nh);
     /* The depth resource still holds what the old snapshot held (a clear
      * would have invalidated both): resolve it again at the next read. */
     if (z->snapshot_valid) z->had_write = 1;
@@ -3977,6 +4043,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         srv_write_depth_source(SRV_DEPTH_SOURCE_BASE + slot, z->tex);
         srv_write_zdepth(SRV_ZDEPTH_BASE + slot, z->snapshot);
         uav_write_zdepth(UAV_ZDEPTH_BASE + slot, z->snapshot);
+        zdepth_pack_create(slot, z->snapshot_w, z->snapshot_h);
     }
     g.list->lpVtbl->ClearDepthStencilView(
         g.list, dsv_handle(1 + slot),
@@ -4036,6 +4103,16 @@ static int zdepth_snapshot(u32 slot)
         nbar++;
     }
     g.list->lpVtbl->ResourceBarrier(g.list, nbar, bars);
+    if (z->pack && z->pack_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+        D3D12_RESOURCE_BARRIER pb = {0};
+        pb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        pb.Transition.pResource = z->pack;
+        pb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        pb.Transition.StateBefore = z->pack_state;
+        pb.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        g.list->lpVtbl->ResourceBarrier(g.list, 1, &pb);
+        z->pack_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
 
     ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
     g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
@@ -4073,6 +4150,18 @@ static int zdepth_snapshot(u32 slot)
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     g.list->lpVtbl->ResourceBarrier(g.list, 2, done);
     z->snapshot_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (z->pack) {
+        D3D12_RESOURCE_BARRIER pb[2] = {0};
+        pb[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        pb[0].UAV.pResource = z->pack;
+        pb[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        pb[1].Transition.pResource = z->pack;
+        pb[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        pb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        pb[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        g.list->lpVtbl->ResourceBarrier(g.list, 2, pb);
+        z->pack_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
     z->snapshot_valid = 1;
     z->had_write = 0;
     return 1;
@@ -7650,7 +7739,22 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
          * depth read: try the zeta first. Before, the colour surface at the
          * same address was taken (zeros). */
         int zeta_pref = 0;
-        if ((t.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM) == TEX_FMT_DEPTH24_D8)
+        /* LD_ZETA_AS_ARGB (default on): Twisted Metal's deferred lights read
+         * the scene Z24S8 through an A8R8G8B8 texture and rebuild depth from
+         * the bytes; the colour surface at that address is an empty ghost. */
+        static int zeta_argb = -1;
+        if (zeta_argb < 0) { const char* e = getenv("LD_ZETA_AS_ARGB"); zeta_argb = e ? atoi(e) : 1; }
+        if (zeta_argb &&
+            (t.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM) == TEX_FMT_A8R8G8B8)
+            for (u32 i = 0; i < g.n_zdepths; i++)
+                if (g.zdepths[i].location == t.location &&
+                    g.zdepths[i].offset == t.offset && g.zdepths[i].pack &&
+                    (g.zdepths[i].had_write || g.zdepths[i].snapshot_valid)) {
+                    zeta_pref = 2;
+                    break;
+                }
+        if (!zeta_pref &&
+            (t.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM) == TEX_FMT_DEPTH24_D8)
             for (u32 i = 0; i < g.n_zdepths; i++)
                 if (g.zdepths[i].location == t.location &&
                     g.zdepths[i].offset == t.offset &&
@@ -7800,6 +7904,26 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             /* Mirror the replay-proven depth-RT contract: address and format
              * must match, and the pass must have executed a depth-writing draw.
              * Clear-only zetas intentionally fall through to guest VRAM. */
+            int packed_depth = -1;
+            if (zeta_pref == 2)
+                for (u32 i = 0; i < g.n_zdepths; i++)
+                    if (g.zdepths[i].location == t.location &&
+                        g.zdepths[i].offset == t.offset &&
+                        (current_zslot != 1 + i || self_zeta_read)) {
+                        if (zdepth_snapshot(1 + i) && g.zdepths[i].pack) packed_depth = (int)i;
+                        break;
+                    }
+            if (packed_depth >= 0) {
+                srv_write_zpack(SRV_ZPACK_BASE + packed_depth, g.zdepths[packed_depth].pack,
+                                t.remap & 0xFFFF);
+                slots[u] = SRV_ZPACK_BASE + packed_depth;
+                g_ld_zdepth_srv_binds++;
+                { static unsigned long n = 0;
+                  if (++n <= 4)
+                      fprintf(stderr, "[zetatrack] zeta #%d %u:0x%X read as A8R8G8B8 (remap 0x%04X)\n",
+                              packed_depth, t.location, t.offset, t.remap & 0xFFFF); }
+                continue;
+            }
             if (texture_base_fmt == TEX_FMT_DEPTH24_D8)
                 for (u32 i = 0; i < g.n_zdepths; i++)
                     if (g.zdepths[i].location == t.location &&
@@ -8323,13 +8447,17 @@ static int make_depth_snapshot_pipeline(void)
     static const char source[] =
         "Texture2D<float> depth_source : register(t0);\n"
         "RWTexture2D<float> depth_destination : register(u0);\n"
+        "RWTexture2D<unorm float4> pack_destination : register(u1);\n"
         "[numthreads(8, 8, 1)]\n"
         "void main(uint3 id : SV_DispatchThreadID) {\n"
         "    uint width, height;\n"
         "    depth_destination.GetDimensions(width, height);\n"
-        "    if (id.x < width && id.y < height)\n"
-        "        depth_destination[id.xy] = "
-        "depth_source.Load(int3(id.xy, 0));\n"
+        "    if (id.x < width && id.y < height) {\n"
+        "        float d = depth_source.Load(int3(id.xy, 0));\n"
+        "        depth_destination[id.xy] = d;\n"
+        "        uint z = (uint)(saturate(d) * 16777215.0 + 0.5);\n"
+        "        pack_destination[id.xy] = float4((z >> 16) & 255, (z >> 8) & 255, z & 255, 0) / 255.0;\n"
+        "    }\n"
         "}\n";
     ID3DBlob* shader = NULL;
     ID3DBlob* errors = NULL;
@@ -8354,7 +8482,7 @@ static int make_depth_snapshot_pipeline(void)
     ranges[0].NumDescriptors = 1;
     ranges[0].BaseShaderRegister = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = 1;
+    ranges[1].NumDescriptors = 2;   /* u0 depth R32F, u1 packed RGBA8 */
     ranges[1].BaseShaderRegister = 0;
     D3D12_ROOT_PARAMETER parameters[2] = {0};
     for (u32 i = 0; i < 2; ++i) {
