@@ -217,6 +217,7 @@ typedef struct {
     struct { ID3D12Resource* tex; ID3D12Resource* src; u32 w, h, wgen, used; } swin[LD_SWIN_PER];
     u32 swin_wgen;            /* bumped by every write into the surface; a window older than it is recopied */
     u64 last_write_serial;    /* production ordering across same-address views */
+    u8  ct0_ghost;            /* only ever the nominal target of colourless (RT_ENABLE 0) draws, see ld_ct_no_colour */
 #if !defined(YZ_PERF_CLEAN)
     u32 resource_serial;
     u32 last_write_generation;
@@ -1366,7 +1367,9 @@ static D3D12_BLEND_OP gcm_blend_op(u32 e)
 }
 
 /* SURFACE_COLOR_TARGET selector -> number of colour targets written, A first.
- * 0x02 (B alone) and anything unknown draw to A only, as before. */
+ * 0 (none) and 0x02 (B alone) still bind one target: which one, and whether
+ * it receives colour, is ld_ct_select's business. Anything unknown draws to A
+ * only, as before. */
 static u32 ld_rt_count(u32 sel)
 {
     switch (sel) {
@@ -1375,6 +1378,46 @@ static u32 ld_rt_count(u32 sel)
     case 0x1F: return 4;
     default:   return 1;
     }
+}
+
+/* LD_CT_SELECT (default on; 0 = every selector draws colour to A, as before).
+ *
+ * Twisted Metal's depth pre-pass and shadow passes set SURFACE_COLOR_TARGET to
+ * 0 (no colour target) and leave colour offset A pointing at the zeta, and its
+ * screen-border fill alternates between selector 1 and 2 (B alone). Drawing
+ * all of those to A wrote colour where the game writes none, left an empty
+ * colour surface at each zeta's address for later texture binds to find, and
+ * put the border of every other frame in the wrong display buffer. */
+static int ld_ct_select(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("LD_CT_SELECT");
+        on = e ? atoi(e) != 0 : 1;
+        fprintf(stderr, "[ct-select] LD_CT_SELECT=%d: colour target selector 0 "
+                        "(no colour) and 2 (B alone) %s\n",
+                on, on ? "honoured" : "drawn to A (legacy)");
+    }
+    return on;
+}
+/* Selector 0 means "no colour target" only once the game has programmed a
+ * real one: the register reads 0 until the first SET_SURFACE_COLOR_TARGET,
+ * and a title that never writes it must keep drawing to A. */
+static int g_ld_ct_seen;
+static int ld_ct_no_colour(u32 color_target)
+{
+    if (color_target) { g_ld_ct_seen = 1; return 0; }
+    return g_ld_ct_seen && ld_ct_select();
+}
+/* Index into the surface's colour offsets of the target a draw or clear
+ * addresses first: B for selector 2, A otherwise. */
+static u32 ld_ct_first(u32 color_target)
+{
+    if (color_target != 0x02 || !ld_ct_select()) return 0;
+    { static int said;
+      if (!said) { said = 1;
+          fprintf(stderr, "[ct-select] selector 0x2: drawing to colour target B\n"); } }
+    return 1;
 }
 
 typedef struct {
@@ -1440,6 +1483,18 @@ static void decode_render_state(render_state_t* rs)
      * shadow-mask depth-prime pass). rsx_dispatch_init seeds the nv40
      * reset default (0x01010101), so never-written reads as all-on. */
     rs->color_mask  = rsx_dsp_reg(&g.rsx, M_COLOR_MASK);
+    /* No colour target selected: the pass writes depth/stencil only, whatever
+     * the colour mask says (ld_ct_select). Folded into the mask so it reaches
+     * the PSO and its key through the existing field. */
+    if (ld_ct_no_colour(alpha_surface.color_target)) {
+        static int said;
+        if (!said) { said = 1;
+            fprintf(stderr, "[ct-select] selector 0: colour writes masked "
+                            "(A=%u:0x%X cmask=0x%08X)\n",
+                    alpha_surface.color_location[0], alpha_surface.color_offset[0],
+                    rs->color_mask); }
+        rs->color_mask = 0;
+    }
     /* Needs a bound depth buffer: the test reads the stored depth. */
     rs->depth_bounds = g.list1 && g.depth &&
         (rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_TEST_ENABLE) & 1);
@@ -3829,12 +3884,14 @@ static u32 current_surface(void)
 {
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
-    const u32 slot = surface_get(sf.color_location[0], sf.color_offset[0],
+    /* Selector 2 addresses colour target B alone (ld_ct_select). */
+    const u32 ct = ld_ct_first(sf.color_target);
+    const u32 slot = surface_get(sf.color_location[ct], sf.color_offset[ct],
                                  sf.clip_w, sf.clip_h,
                                  sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
                                      ? DXGI_FORMAT_R16G16B16A16_FLOAT
                                      : DXGI_FORMAT_R8G8B8A8_UNORM);
-    if (slot != LD_INVALID_SURFACE) g.surfaces[slot].pitch = sf.color_pitch[0];
+    if (slot != LD_INVALID_SURFACE) g.surfaces[slot].pitch = sf.color_pitch[ct];
     return slot;
 }
 
@@ -8044,6 +8101,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
               if (sf_i->location != t.location || sf_i->offset != t.offset ||
                   i == target)
                   continue;
+              /* The nominal colour target of colourless passes holds nothing
+               * the game drew (ld_ct_select): not a texture source. */
+              if (sf_i->ct0_ghost && !sf_i->last_write_serial)
+                  continue;
               if (sf_i->w == t.width && sf_i->h == t.height) { sampled = (int)i; break; }
               if (sampled < 0 || sf_i->last_draw_generation > best_gen) {
                   sampled = (int)i;
@@ -8475,9 +8536,19 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     } else {
         g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
     }
-    ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
-    for (u32 r = 1; r < n_mrt; r++)
-        ld_surface_note_write(mrt[r], LD_SURFACE_WRITE_DRAW);
+    if (ld_ct_no_colour(sf.color_target)) {
+        /* Nothing reached the colour surface (its write mask is 0): do not
+         * record a write, and if nothing else ever wrote it, mark it so the
+         * texture loop above does not take it for the content at its
+         * address -- there it shadowed the zeta that lives at the same
+         * offset. Any real write clears the condition by itself. */
+        if (!g.surfaces[target].last_write_serial)
+            g.surfaces[target].ct0_ghost = 1;
+    } else {
+        ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
+        for (u32 r = 1; r < n_mrt; r++)
+            ld_surface_note_write(mrt[r], LD_SURFACE_WRITE_DRAW);
+    }
     if (current_zslot) {
         render_state_t depth_state;
         decode_render_state(&depth_state);
