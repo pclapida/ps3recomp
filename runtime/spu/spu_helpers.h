@@ -464,21 +464,27 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) { return spu_selb_ref(a, b, 
 #if defined(__SSE4_1__)
 #include <smmintrin.h>
 /* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
- * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
- * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
+ * as the byte loop, and the most frequent op in Twisted Metal's post-FX
+ * jobs). SPU byte P lives at host byte SPU_W(P), i.e. the bytes of each
+ * 32-bit word reversed. */
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
-    const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+    /* No swap into SPU byte order and back: SPU byte P is host byte P^3 in all
+     * three operands and in the result, so the control byte at host position k
+     * already governs the result byte at host position k, and only the index
+     * it holds needs the ^3. pshufb yields 0 for an index byte with bit 7 set
+     * and otherwise uses its low four bits, so bit 4 (which operand) is moved
+     * to bit 7 to switch each source off where the other one is selected; a
+     * special selector has bit 7 set already and switches both off. */
     __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
-    A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);
-    const __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0F));
-    const __m128i fromb = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
-    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), fromb);
+    const __m128i hi = _mm_set1_epi8((char)0x80);
+    const __m128i x  = _mm_xor_si128(C, _mm_set1_epi8(3));
+    const __m128i b4 = _mm_and_si128(_mm_slli_epi16(C, 3), hi);
+    __m128i r = _mm_or_si128(_mm_shuffle_epi8(A, _mm_or_si128(x, b4)),
+                             _mm_shuffle_epi8(B, _mm_or_si128(x, _mm_xor_si128(b4, hi))));
     /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
-    const __m128i m80 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0x80)), _mm_set1_epi8((char)0x80));
     const __m128i mC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xC0)), _mm_set1_epi8((char)0xC0));
     const __m128i mE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xE0)), _mm_set1_epi8((char)0xE0));
-    const __m128i special = _mm_blendv_epi8(mC0, _mm_set1_epi8((char)0x80), mE0);
-    r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
+    r = _mm_or_si128(r, _mm_xor_si128(mC0, _mm_and_si128(mE0, _mm_set1_epi8(0x7F))));
     u128 out; memcpy(&out, &r, 16); return out;
 }
 #elif defined(__ARM_NEON)
