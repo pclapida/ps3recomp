@@ -1961,6 +1961,92 @@ static void ld_flush(ld_flush_reason reason)
 #endif
 }
 
+/* LD_SUBMIT_DRAWS=<n> (default 0 = off; 256 is the value tried): hand the GPU
+ * what has been recorded every n draws, without waiting for it.
+ *
+ * Off by default. It works as intended -- Twisted Metal's match went from 3
+ * to 7-8 presented frames a second -- and the presented frames came out
+ * half-composited (run89). Every ring here is recycled only behind a waiting
+ * flush, so this does not look like a GPU-side race; the walker simply got
+ * faster, and that title's main-memory composite is only complete when the
+ * walker reaches the upload late enough (the same failure as presenting at
+ * each flip). See GCM_BLIT_WAIT_JOBS_MS in cellGcmSys.c.
+ *
+ * ld_flush is the only place commands reach the GPU, and it waits for them.
+ * So a scene was recorded in full with the GPU idle, and then the walker sat
+ * in the flush with the CPU idle while the GPU executed all of it -- once per
+ * present, or, with the NV3089 round trip, once per scene at the read-back
+ * (~12-20 ms each in Twisted Metal). Submitting as the scene goes lets the
+ * two overlap: by the time something has to wait, most of the scene is done.
+ *
+ * A submit closes and executes the list, signals the fence, and reopens the
+ * list on another allocator; the one just used cannot be reset until its
+ * commands have run. Nothing else changes hands: the rings, the retired
+ * resources and the upload space are still recycled only by ld_flush, whose
+ * wait on the newest fence value covers every earlier submit. With no free
+ * allocator the submit is skipped. Call only between draws: the reopened
+ * list has no state, and every draw, clear and copy sets its own. */
+#define LD_SUBMIT_ALLOCATORS 4
+static ID3D12CommandAllocator* s_submit_alloc[LD_SUBMIT_ALLOCATORS];
+static u64 s_submit_fence[LD_SUBMIT_ALLOCATORS];
+static u32 s_submit_current;
+static u64 s_submit_done, s_submit_skipped;
+
+static int ld_submit_every(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        const char* e = getenv("LD_SUBMIT_DRAWS");
+        n = e ? atoi(e) : 0;
+        if (n < 0) n = 0;
+        fprintf(stderr, "[submit] LD_SUBMIT_DRAWS=%d: %s\n", n,
+                n ? "recorded commands go to the GPU every that many draws, without waiting"
+                  : "commands reach the GPU only at a waiting flush (legacy)");
+    }
+    return n;
+}
+
+static void ld_submit_nowait(void)
+{
+    if (!g.ready) return;
+    if (!s_submit_alloc[0]) { s_submit_alloc[0] = g.alloc; s_submit_current = 0; }
+    /* An allocator whose commands have all run (or that was never used). */
+    const u64 completed = g.fence->lpVtbl->GetCompletedValue(g.fence);
+    u32 pick = LD_SUBMIT_ALLOCATORS;
+    for (u32 i = 0; i < LD_SUBMIT_ALLOCATORS && pick == LD_SUBMIT_ALLOCATORS; i++) {
+        if (i == s_submit_current) continue;
+        if (!s_submit_alloc[i]) {
+            if (FAILED(g.dev->lpVtbl->CreateCommandAllocator(g.dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &IID_ID3D12CommandAllocator, (void**)&s_submit_alloc[i]))) {
+                s_submit_alloc[i] = NULL;
+                continue;
+            }
+            s_submit_fence[i] = 0;
+        }
+        if (s_submit_fence[i] <= completed) pick = i;
+    }
+    if (pick == LD_SUBMIT_ALLOCATORS) { s_submit_skipped++; return; }   /* GPU is behind: keep recording */
+    if (FAILED(s_submit_alloc[pick]->lpVtbl->Reset(s_submit_alloc[pick]))) { s_submit_skipped++; return; }
+    if (FAILED(g.list->lpVtbl->Close(g.list))) {
+        fprintf(stderr, "[d3d-fail] command-list Close (submit) frame=%u\n", g_ld_frames);
+        g.ready = 0;
+        return;
+    }
+    ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
+    g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+    const u64 v = ++g.fence_value;
+    g.queue->lpVtbl->Signal(g.queue, g.fence, v);
+    s_submit_fence[s_submit_current] = v;
+    s_submit_current = pick;
+    g.alloc = s_submit_alloc[pick];          /* ld_flush resets and reuses g.alloc */
+    g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+    s_submit_done++;
+    if (s_submit_done == 1u || (s_submit_done & 0x3FFFu) == 0)
+        fprintf(stderr, "[submit] frame %u: %llu early submits, %llu skipped (no free allocator)\n",
+                g_ld_frames, (unsigned long long)s_submit_done,
+                (unsigned long long)s_submit_skipped);
+}
+
 /* Public wrapper for the RSX SET_REFERENCE / sync fence: block until the GPU
  * has finished all queued draws (mirrors RPCS3 nv406e::set_reference's sync(),
  * RSXThread.cpp), so the game's REF poll advances only after the GPU has really
@@ -9484,6 +9570,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             z->had_write = 1;
     }
     g_ld_stats.groups_executed++;
+    /* The draw is recorded in full; nothing of it is pending on the list. */
+    { static u32 since_submit;
+      const int every = ld_submit_every();
+      if (every && ++since_submit >= (u32)every) { since_submit = 0; ld_submit_nowait(); } }
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.input_vertices += dc.n_source_refs;
     g_ld_profile.total.expanded_vertices += n_tri;
@@ -12169,6 +12259,13 @@ void rsx_live_draw_shutdown(void)
     }
 #endif
     if (s_guest_rb) { s_guest_rb->lpVtbl->Release(s_guest_rb); s_guest_rb = NULL; s_guest_rb_bytes = 0; }
+    for (u32 k = 0; k < LD_SUBMIT_ALLOCATORS; k++) {
+        /* g.alloc is one of them (or none, if no early submit ever ran) */
+        if (s_submit_alloc[k] && s_submit_alloc[k] != g.alloc)
+            s_submit_alloc[k]->lpVtbl->Release(s_submit_alloc[k]);
+        s_submit_alloc[k] = NULL; s_submit_fence[k] = 0;
+    }
+    s_submit_current = 0;
     for (u32 k = 0; k < LD_GUEST_SRCS; k++)
         if (s_guest_src[k].pend_buf) s_guest_src[k].pend_buf->lpVtbl->Release(s_guest_src[k].pend_buf);
     memset(s_guest_src, 0, sizeof(s_guest_src));
