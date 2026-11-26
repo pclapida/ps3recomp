@@ -4385,6 +4385,93 @@ static void shader_disk_cache_store(
     shader_disk_cache_progress(value);
 }
 
+/* LD_SHADOW_DEPTH16 (default 1; 0 = off; 2 = also compare DEPTH24_D8 reads).
+ *
+ * Twisted Metal samples its shadow map (zeta 0:0x22D0000) as DEPTH16
+ * (0x92 + LN + UN) and sums the taps without comparing anything: the program
+ * relies on the hardware depth comparison selected by the zfunc field of
+ * TEXTURE_ADDRESS. Two things were missing. The bind took the colour surface
+ * at the zeta's address (the empty nominal target of the shadow pass) because
+ * only 0x90 was treated as a depth read, and the fragment program was
+ * translated without the comparison, so even real depth would have been
+ * summed as if it were light. Six zero taps = everything in shadow.
+ *
+ * DEPTH24_D8 comparison stays opt-in (=2): titles already running on this
+ * path read 0x90 as plain depth with whatever zfunc they left behind. */
+static int ld_shadow_depth16(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char* e = getenv("LD_SHADOW_DEPTH16");
+        mode = e ? atoi(e) : 1;
+        if (mode < 0) mode = 0;
+        fprintf(stderr, "[shadow16] LD_SHADOW_DEPTH16=%d: DEPTH16 textures %s\n",
+                mode, mode ? "read the zeta snapshot, with hardware depth comparison"
+                           : "handled as before (colour surface, no comparison)");
+    }
+    return mode;
+}
+
+/* A texture format whose read of a zeta's address is a depth read (binds the
+ * zeta snapshot rather than a colour surface at that address). */
+static int ld_tex_reads_zeta_depth(u32 format)
+{
+    const u32 base = format & TEX_FMT_BASE_MASK;
+    if (base == TEX_FMT_DEPTH24_D8) return 1;
+    /* DEPTH24_D8_FLOAT, DEPTH16, DEPTH16_FLOAT */
+    return base >= 0x91 && base <= 0x93 && ld_shadow_depth16();
+}
+
+/* Depth-comparison descriptors of the current fragment program's texture
+ * units, for rsx_fp_decompile_buffered_shadow_ex. Returns the mask of units
+ * that compare (0 = translate as before; `out` is then all zero). A unit whose
+ * layout the translator does not support (float depth, mip chain, mismatched
+ * min/mag filter) is left without comparison instead of failing the draw. */
+static u32 ld_shadow_descs(const u8* fp_uc, u32 fp_size, rsx_fp_shadow_desc out[16])
+{
+    memset(out, 0, 16 * sizeof(out[0]));
+    const int mode = ld_shadow_depth16();
+    /* The comparison exists in the buffered-constant translator only. */
+    if (!mode || !ld_fp_constants_buffered()) return 0;
+    u32 candidates = 0;
+    rsx_dsp_texture t[RSX_DSP_NUM_TEXTURES];
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        rsx_dsp_get_texture(&g.rsx, u, &t[u]);
+        if (!t[u].enabled) continue;
+        const u32 base = t[u].format & TEX_FMT_BASE_MASK;
+        if (base == TEX_FMT_DEPTH24_D8 ? mode >= 2 : (base >= 0x91 && base <= 0x93))
+            candidates |= 1u << u;
+    }
+    if (!candidates) return 0;   /* the common draw: no program scan */
+    candidates &= rsx_fp_texture_units(fp_uc, fp_size);
+    u32 mask = 0;
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        if (!((candidates >> u) & 1u)) continue;
+        rsx_fp_shadow_desc d;
+        rsx_fp_shadow_desc_from_texture(&d, t[u].format, t[u].dimension,
+            t[u].cubemap, t[u].mipmaps, t[u].filter, t[u].wrap, t[u].control0);
+        if (d.enabled == 1) {
+            out[u] = d;
+            mask |= 1u << u;
+            { static u32 n;
+              if (PS3_LOG_FIRST(n, 4))
+                  fprintf(stderr, "[shadow16] unit %u %u:0x%X fmt=0x%02X %ux%u: depth "
+                                  "comparison zfunc=%u %s%s\n",
+                          u, t[u].location, t[u].offset, t[u].format & 0xFF,
+                          t[u].width, t[u].height, d.func,
+                          d.linear ? "linear" : "nearest",
+                          d.unnormalized ? " texel coordinates" : ""); }
+        } else if (d.enabled) {
+            static u32 n;
+            if (PS3_LOG_FIRST(n, 4))
+                fprintf(stderr, "[shadow16] unit %u fmt=0x%02X mips=%u filter=0x%08X: "
+                                "comparison layout not supported, sampled without it\n",
+                        u, t[u].format & 0xFF, t[u].mipmaps, t[u].filter);
+        }
+    }
+    return mask;
+}
+
 /* A graphics PSO with the depth bounds test enabled.
  *
  * D3D12_GRAPHICS_PIPELINE_STATE_DESC has no field for the test: it lives in
@@ -5184,8 +5271,7 @@ static ID3D12PipelineState* get_pso(
          * coordinates address the resource, so divide by its size: a texture
          * smaller than the zeta then reads its top-left corner, as it does in
          * VRAM, instead of a stretched copy of the whole depth buffer. */
-        if ((ut.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM) ==
-                TEX_FMT_DEPTH24_D8) {
+        if (ld_tex_reads_zeta_depth(ut.format)) {
             for (u32 zi = 0; zi < g.n_zdepths; zi++) {
                 const zdepth_t* z = &g.zdepths[zi];
                 if (z->location != ut.location || z->offset != ut.offset)
@@ -5205,6 +5291,14 @@ static ID3D12PipelineState* get_pso(
     }
     key = fnv1a(&unnorm_mask, sizeof(unnorm_mask), key);
     if (unnorm_mask) key = fnv1a(unnorm_dim, sizeof(unnorm_dim), key);
+    /* Hardware depth comparison (ld_shadow_descs) is baked into the HLSL, so
+     * func/filter/addressing of every comparing unit is PSO identity. Hashed
+     * only when a unit compares: all other keys stay what they were. The
+     * on-disk shader cache is keyed by the HLSL source itself, so a program
+     * translated both ways gets two entries and needs no version bump. */
+    rsx_fp_shadow_desc shadow[16];
+    const u32 shadow_mask = ld_shadow_descs(fp_uc, fp_size, shadow);
+    if (shadow_mask) key = fnv1a(shadow, sizeof(shadow), key);
     if (masked_layout) {
         static const u32 masked_layout_tag = 0x314B534Du; /* "MSK1" */
         const u32 payload_stride =
@@ -5289,9 +5383,26 @@ static ID3D12PipelineState* get_pso(
     u32 decompiled_constant_count = 0;
     int fi;
     if (ld_fp_constants_buffered()) {
-        fi = rsx_fp_decompile_buffered_ex(
-            fp_uc, fp_size, fp_ctrl, cube_mask, ps_hlsl,
-            sizeof(ps_hlsl), &decompiled_constant_count);
+        fi = shadow_mask
+            ? rsx_fp_decompile_buffered_shadow_ex(
+                fp_uc, fp_size, fp_ctrl, cube_mask, shadow, ps_hlsl,
+                sizeof(ps_hlsl), &decompiled_constant_count)
+            : rsx_fp_decompile_buffered_ex(
+                fp_uc, fp_size, fp_ctrl, cube_mask, ps_hlsl,
+                sizeof(ps_hlsl), &decompiled_constant_count);
+        if (fi <= 0 && shadow_mask) {
+            /* The comparison is refused for some fetches (TXB/TXL/TXD on a
+             * comparing unit). Draw it uncompared, as before, rather than
+             * drop it. */
+            static u32 n;
+            if (PS3_LOG_FIRST(n, 4))
+                fprintf(stderr, "[shadow16] comparison rejected by the translator "
+                                "(units 0x%X); program translated without it\n",
+                        shadow_mask);
+            fi = rsx_fp_decompile_buffered_ex(
+                fp_uc, fp_size, fp_ctrl, cube_mask, ps_hlsl,
+                sizeof(ps_hlsl), &decompiled_constant_count);
+        }
         if (fi > 0 &&
             decompiled_constant_count != g.fp_constants.count)
             fi = -1;
@@ -6820,6 +6931,11 @@ static u64 live_legacy_pso_key(void)
     render_state_t rs;
     decode_render_state(&rs);
     key = fnv1a(&rs, LD_RS_KEY_BYTES(&rs), key);
+    /* Same shadow-compare identity as get_pso, so two programs that differ
+     * only in it do not share an LD_HLSL_DUMP file name. */
+    rsx_fp_shadow_desc shadow[16];
+    if (ld_shadow_descs(fp_uc, fp_size, shadow))
+        key = fnv1a(shadow, sizeof(shadow), key);
     return key;
 }
 
@@ -7911,8 +8027,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                     zeta_pref = 2;
                     break;
                 }
-        if (!zeta_pref &&
-            (t.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM) == TEX_FMT_DEPTH24_D8)
+        /* DEPTH16 too (ld_shadow_depth16): a shadow map read through 0x92. */
+        if (!zeta_pref && ld_tex_reads_zeta_depth(t.format))
             for (u32 i = 0; i < g.n_zdepths; i++)
                 if (g.zdepths[i].location == t.location &&
                     g.zdepths[i].offset == t.offset &&
@@ -8057,8 +8173,6 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             if (!seen && n_surf_used < SRV_TABLE_SIZE) surf_used[n_surf_used++] = (u32)sampled;
         } else {
             int sampled_depth = -1;
-            const u32 texture_base_fmt =
-                t.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
             /* Mirror the replay-proven depth-RT contract: address and format
              * must match, and the pass must have executed a depth-writing draw.
              * Clear-only zetas intentionally fall through to guest VRAM. */
@@ -8082,7 +8196,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                               packed_depth, t.location, t.offset, t.remap & 0xFFFF); }
                 continue;
             }
-            if (texture_base_fmt == TEX_FMT_DEPTH24_D8)
+            if (ld_tex_reads_zeta_depth(t.format))
                 for (u32 i = 0; i < g.n_zdepths; i++)
                     if (g.zdepths[i].location == t.location &&
                         g.zdepths[i].offset == t.offset &&
